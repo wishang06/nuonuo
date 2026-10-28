@@ -244,8 +244,10 @@ class Perception:
             self.mood = "surprised"
         elif st["smiling"]:
             self.mood = "happy"
-        elif st["frowning"] or st["tired"] or st["absent"]:
+        elif st["frowning"] or st["absent"]:
             self.mood = "sad"
+        elif st["tired"]:
+            self.mood = "sleepy"
         else:
             self.mood = "neutral"
 

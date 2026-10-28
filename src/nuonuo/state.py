@@ -13,6 +13,8 @@ class SharedState:
     mode: str = "chatty"
     status: str = "starting"
     last_event: str = ""
+    face_x: float | None = None
+    face_y: float | None = None
     stop: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     last_audio_ts: float = 0.0
@@ -33,4 +35,6 @@ class SharedState:
                 "mode": self.mode,
                 "status": self.status,
                 "last_event": self.last_event,
+                "face_x": self.face_x,
+                "face_y": self.face_y,
             }

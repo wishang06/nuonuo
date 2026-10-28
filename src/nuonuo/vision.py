@@ -135,7 +135,13 @@ class VisionWorker(threading.Thread):
                 ev = self.perception.update(now, blend, yaw, gesture, wrist_x, pitch)
                 if self.timeline is not None:
                     self.timeline.observe(self.clock.t_ms(now), self.perception.state_label())
-                self.state.set(mood=self.perception.mood)
+                face_x = face_y = None
+                if fr.face_landmarks:
+                    pts = fr.face_landmarks[0]
+                    if pts:
+                        face_x = (sum(p.x for p in pts) / len(pts) - 0.5) * 2
+                        face_y = (sum(p.y for p in pts) / len(pts) - 0.5) * 2
+                self.state.set(mood=self.perception.mood, face_x=face_x, face_y=face_y)
                 if ev:
                     self.state.set(last_event=ev.text)
                     self.on_event(ev)

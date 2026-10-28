@@ -171,7 +171,7 @@ class RealtimeClient:
                 mic.stop()
                 mic.close()
                 self.player.close()
-                if not self.started.is_set():
+                if not self.started.is_set() and self.state.snapshot()["status"] == "connecting":
                     self.state.set(status="voice offline")
 
     def _mode(self) -> str:
@@ -375,10 +375,10 @@ class RealtimeClient:
                 inner = ev.get("event") or {}
                 if inner.get("type") in ("response.completed", "response.done"):
                     usage = (inner.get("response") or {}).get("usage") or inner.get("usage")
-                if isinstance(usage, dict) and (
-                    "input_token_details" in usage or "output_token_details" in usage
-                ):
-                    self.logger.add_usage(usage)
+                    if isinstance(usage, dict) and (
+                        "input_token_details" in usage or "output_token_details" in usage
+                    ):
+                        self.logger.add_usage(usage)
             elif kind == "response.output_item.done":
                 await self._answer_camera(ws, ev)
             elif kind == "session.usage.updated":
@@ -395,7 +395,19 @@ class RealtimeClient:
                 return
             elif kind == "error":
                 err = ev.get("error", ev)
+                code = err.get("code") if isinstance(err, dict) else None
+                message = err.get("message") if isinstance(err, dict) else str(err)
                 log.warning("live error: %s", err)
+                if code == "forbidden":
+                    log.error(
+                        "OpenAI refused the voice session (%s). "
+                        "A previous run may still be holding one, or this API key cannot open GPT-Live. "
+                        "Wait a minute and start again. The avatar keeps running.",
+                        message,
+                    )
+                    self.closed = True
+                    self.state.set(status="voice denied")
+                    return
 
 
 def run_realtime_thread(client: RealtimeClient) -> threading.Thread:
