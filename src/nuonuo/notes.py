@@ -18,7 +18,10 @@ READ_CAMERA_TOOL = {
     "parameters": {
         "type": "object",
         "properties": {},
+        "required": [],
+        "additionalProperties": False,
     },
+    "strict": True,
 }
 
 
@@ -80,51 +83,62 @@ def format_camera_note(body: str) -> str:
     return f"{CAMERA_NOTE_PREFIX} {body.strip()}"
 
 
+def unwrap_live_event(event: dict) -> dict:
+    """Responses events arrive nested inside a response.event envelope."""
+    if event.get("type") == "response.event" and isinstance(event.get("event"), dict):
+        return event["event"]
+    return event
+
+
 def camera_call_ids(event: dict) -> list[str]:
-    """Pull read_camera call ids from a Realtime server event."""
-    kind = event.get("type")
-    if kind == "response.function_call_arguments.done":
-        if event.get("name") == "read_camera" and event.get("call_id"):
-            return [event["call_id"]]
+    """Pull completed read_camera call ids from a GPT-Live server event."""
+    inner = unwrap_live_event(event)
+    if inner.get("type") != "response.output_item.done":
         return []
-    if kind == "response.output_item.done":
-        item = event.get("item") or {}
-        if item.get("type") == "function_call" and item.get("name") == "read_camera" and item.get("call_id"):
-            return [item["call_id"]]
-        return []
-    if kind != "response.done":
-        return []
-    output = (event.get("response") or {}).get("output") or []
-    return [
-        item["call_id"]
-        for item in output
-        if item.get("type") == "function_call"
-        and item.get("name") == "read_camera"
-        and item.get("call_id")
-    ]
+    item = inner.get("item") or {}
+    if item.get("type") == "function_call" and item.get("name") == "read_camera" and item.get("call_id"):
+        return [item["call_id"]]
+    return []
 
 
 def camera_tool_reply(call_id: str, result: dict) -> list[dict]:
-    """function_call_output, then response.create, as the Realtime guide specifies."""
+    """Return the tool result, then continue the delegated Responses turn."""
     return [
         {
-            "type": "conversation.item.create",
+            "type": "response.item.create",
+            "event_id": f"tool_{call_id}",
             "item": {
                 "type": "function_call_output",
                 "call_id": call_id,
                 "output": json.dumps(result),
             },
         },
-        {"type": "response.create"},
+        {"type": "response.create", "event_id": f"continue_{call_id}"},
     ]
 
 
-def text_item(text: str) -> dict:
+def thinking_append(event_id: str, content: str) -> dict:
     return {
-        "type": "conversation.item.create",
-        "item": {
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": text}],
-        },
+        "type": "session.thinking.append",
+        "event_id": event_id,
+        "delegation_id": None,
+        "content": content,
+    }
+
+
+def commentary_append(event_id: str, content: str) -> dict:
+    return {
+        "type": "session.commentary.append",
+        "event_id": event_id,
+        "delegation_id": None,
+        "content": content,
+    }
+
+
+def instructions_append(event_id: str, content: str) -> dict:
+    return {
+        "type": "session.instructions.append",
+        "event_id": event_id,
+        "delegation_id": None,
+        "content": content,
     }

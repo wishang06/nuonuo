@@ -68,6 +68,7 @@ class SessionLogger:
         self.start = time.monotonic()
         self.events: dict[str, dict] = {}
         self.flushed = 0
+        self.voice_seconds = None
         self.lock = threading.Lock()
 
     def _flush(self, force: bool = False) -> None:
@@ -103,6 +104,10 @@ class SessionLogger:
         with self.lock:
             self.usage.add(usage)
 
+    def set_voice_seconds(self, seconds: float) -> None:
+        with self.lock:
+            self.voice_seconds = seconds
+
     def close(self) -> dict:
         with self.lock:
             self._flush(force=True)
@@ -112,6 +117,7 @@ class SessionLogger:
                 "end": _now(),
                 "duration_seconds": round(time.monotonic() - self.start, 1),
                 "usage": self.usage.as_dict(),
+                "voice_seconds": self.voice_seconds,
                 "estimated_cost_usd": round(self.usage.cost(self.model), 5),
                 "rates_per_million": rates_for(self.model),
                 "vision_events": self.flushed,

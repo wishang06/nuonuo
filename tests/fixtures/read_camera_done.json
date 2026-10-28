@@ -1,13 +1,14 @@
 {
-  "type": "response.done",
-  "response": {
-    "output": [
-      {
-        "type": "function_call",
-        "name": "read_camera",
-        "call_id": "call_test_camera",
-        "arguments": "{}"
-      }
-    ]
+  "type": "response.event",
+  "event_id": "evt_response_1",
+  "delegation_id": "del_1",
+  "event": {
+    "type": "response.output_item.done",
+    "item": {
+      "type": "function_call",
+      "name": "read_camera",
+      "call_id": "call_test_camera",
+      "arguments": "{}"
+    }
   }
 }

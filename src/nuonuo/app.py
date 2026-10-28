@@ -82,7 +82,10 @@ def main(argv=None) -> None:
     memories = memory.memory_lines()
 
     user = os.getenv("USER_NAME", "Andy")
-    model = args.model or os.getenv("NUONUO_MODEL", "gpt-realtime-2.1-mini")
+    model = args.model or os.getenv("NUONUO_MODEL", "gpt-live-1")
+    if model.startswith("gpt-realtime"):
+        log.warning("NUONUO_MODEL=%s is a Realtime model; using gpt-live-1", model)
+        model = "gpt-live-1"
     vision_on = _truthy(os.getenv("VISION_ENABLED"), True) and not args.no_vision
     state = SharedState(vision_enabled=vision_on, preview=args.preview, mode=args.mode)
 
@@ -102,7 +105,16 @@ def main(argv=None) -> None:
         from nuonuo.realtime import RealtimeClient, run_realtime_thread
 
         client = RealtimeClient(
-            state, key, model, os.getenv("NUONUO_VOICE", "marin"), user, slog, timeline, clock, memories
+            state,
+            key,
+            model,
+            os.getenv("NUONUO_VOICE", "marin"),
+            user,
+            slog,
+            timeline,
+            clock,
+            memories,
+            os.getenv("NUONUO_BACKEND_MODEL", "gpt-6-luna"),
         )
         rt_thread = run_realtime_thread(client)
     else:
