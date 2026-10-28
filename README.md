@@ -32,14 +32,15 @@ Nuonuo is an energetic little anime companion that lives in a small always-on-to
 
 `V` toggles vision · `P` toggles preview · `M` toggles chatty/quiet · `Esc`/`Q` quits · `Ctrl+C` in the terminal also quits cleanly. The window shows the current mode. Click the window first so the keys land on it.
 
-Tune the painted avatar without the camera:
+Tune the sprite avatar without the camera:
 
 ```powershell
 uv run python -m nuonuo.avatar --preview
+uv run python -m nuonuo.avatar --preview --wav clip.wav
 uv run python -m nuonuo.avatar --calibrate
 ```
 
-`--preview` cycles a blink, a look-around, talking, and the expressions. `--calibrate` draws the eye and mouth boxes on `assets/nuonuo_base.png`. Tab changes the selected box, the arrow keys move it, `+`/`-` resize it, and `C` prints a `REGIONS` block to paste into `avatar.py`.
+`--preview` starts on idle. `1` idle, `2` or `T` a test tone that drives talking, `3` happy, `4` sleepy, `5` surprised, `6` listening. The line under the picture shows the clip, the smoothed voice level, and the mouth bucket. `--calibrate` draws the mouth box on a talk frame. Arrow keys move it, `+`/`-` resize it, and `C` writes the box into `assets/anim/clips.yaml`.
 
 ### .env
 
@@ -112,7 +113,7 @@ Run the tests with `uv run pytest`.
 
 ## Known limitations
 
-- The avatar is `assets/nuonuo_base.png` with eyelid, iris, and mouth overlays. `OverlayAvatar` implements `set_mouth`, `blink`, `look_at`, and `set_expression`, so a Live2D or Inochi2D renderer can replace it without changing the rest of the app.
+- The avatar plays clips from `assets/anim/clips.yaml`. Talking uses mouth frames from `talk.mp4` chosen by the voice level. `SpriteAvatar` implements `set_mouth_level`, `play_state`, `look_at`, and `set_expression`, so a Live2D, Inochi2D, or LivePortrait renderer can replace it without changing the rest of the app.
 - Rule thresholds are heuristic. Tune them in `perception.CONFIG` using `--preview`.
 - Head yaw and pitch use the mirrored-preview convention (positive yaw to your right, positive pitch chin up) and assume a front-facing webcam. Looking down means pitch at or below -15 degrees. The sign has not been checked on this laptop's camera.
 - There is no echo cancellation, so use headphones.

@@ -1,0 +1,20 @@
+mouth:
+  box: [210, 248, 60, 40]
+  buckets: 5
+clips:
+  - name: idle
+    file: idle.mp4
+    loop: true
+    state: idle
+  - name: look
+    file: ../looking_around.gif
+    loop: false
+    state: idle
+  - name: talk
+    file: talk.mp4
+    loop: false
+    state: talking
+  - name: happy
+    file: happy.mp4
+    loop: false
+    state: happy

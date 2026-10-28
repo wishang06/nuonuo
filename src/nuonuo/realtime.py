@@ -242,6 +242,7 @@ class RealtimeClient:
             await asyncio.sleep(0.25)
             if self.user_speaking and time.monotonic() - self.last_user_transcript > USER_SPEECH_GAP:
                 self.user_speaking = False
+                self.state.set(user_speaking=False)
                 if not (self.player and self.player.playing()):
                     self.state.set(status="listening")
             if self._tick_queued or self.out_q is None:
@@ -363,9 +364,9 @@ class RealtimeClient:
             elif kind == "session.input_transcript.delta":
                 self.user_speaking = True
                 self.last_user_transcript = time.monotonic()
+                self.state.set(user_speaking=True, status="hearing you")
                 if self.player:
                     self.player.interrupt()
-                self.state.set(status="hearing you")
                 self._remember_transcript("user", ev)
             elif kind == "session.output_transcript.delta":
                 self._remember_transcript("nuonuo", ev)
