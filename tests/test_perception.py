@@ -99,6 +99,22 @@ def test_looking_away_by_yaw_and_back():
     assert texts(evs) == ["[Andy just looked back]"]
 
 
+def test_looking_down_is_not_looking_away():
+    p = Perception()
+    _, t = run(p, 1, 0, yaw=0.0, pitch=0.0)
+    evs, _ = run(p, 2, t, yaw=40.0, pitch=-30.0)
+    assert any("phone" in x for x in texts(evs))
+    assert not any("looked away" in x for x in texts(evs))
+    assert p.state_label() == "looking_down"
+
+
+def test_pitch_spike_does_not_count_as_looking_down():
+    p = Perception()
+    _, t = run(p, 1, 0, yaw=0.0, pitch=0.0)
+    evs, _ = run(p, 0.1, t, yaw=0.0, pitch=-40.0)
+    assert not any("phone" in x for x in texts(evs))
+
+
 def test_looking_away_by_eyes():
     p = Perception()
     _, t = run(p, 1, 0)

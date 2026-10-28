@@ -1,5 +1,4 @@
 import logging
-import math
 import threading
 import time
 import urllib.request
@@ -7,10 +6,12 @@ from pathlib import Path
 from typing import Callable
 
 import cv2
-import numpy as np
 
+from nuonuo.clock import SessionClock
 from nuonuo.perception import Perception, PerceptionEvent
+from nuonuo.pose import head_pose_from_matrix
 from nuonuo.state import SharedState
+from nuonuo.timeline import BehaviourTimeline
 
 log = logging.getLogger("nuonuo.vision")
 
@@ -34,11 +35,6 @@ def ensure_models(models_dir: Path) -> dict[str, Path]:
     return paths
 
 
-def yaw_from_matrix(m: np.ndarray) -> float:
-    r = np.asarray(m)[:3, :3]
-    return math.degrees(math.atan2(-r[2, 0], math.hypot(r[0, 0], r[1, 0])))
-
-
 class VisionWorker(threading.Thread):
     def __init__(
         self,
@@ -47,12 +43,16 @@ class VisionWorker(threading.Thread):
         models_dir: Path,
         user_name: str = "Andy",
         camera_index: int = 0,
+        timeline: BehaviourTimeline | None = None,
+        clock: SessionClock | None = None,
     ):
         super().__init__(name="vision", daemon=True)
         self.state = state
         self.on_event = on_event
         self.models_dir = models_dir
         self.camera_index = camera_index
+        self.timeline = timeline
+        self.clock = clock or SessionClock()
         self.perception = Perception(user_name=user_name)
 
     def run(self) -> None:
@@ -117,11 +117,13 @@ class VisionWorker(threading.Thread):
                 fr = face.detect_for_video(image, ts)
                 gr = gest.recognize_for_video(image, ts)
 
-                blend = yaw = None
+                blend = yaw = pitch = None
                 if fr.face_blendshapes:
                     blend = {c.category_name: c.score for c in fr.face_blendshapes[0]}
                     if fr.facial_transformation_matrixes:
-                        yaw = yaw_from_matrix(fr.facial_transformation_matrixes[0])
+                        pose = head_pose_from_matrix(fr.facial_transformation_matrixes[0])
+                        if pose is not None:
+                            yaw, pitch, _roll = pose
                 gesture = wrist_x = None
                 if gr.gestures and gr.gestures[0]:
                     top = gr.gestures[0][0]
@@ -130,14 +132,16 @@ class VisionWorker(threading.Thread):
                 if gr.hand_landmarks:
                     wrist_x = gr.hand_landmarks[0][0].x
 
-                ev = self.perception.update(now, blend, yaw, gesture, wrist_x)
+                ev = self.perception.update(now, blend, yaw, gesture, wrist_x, pitch)
+                if self.timeline is not None:
+                    self.timeline.observe(self.clock.t_ms(now), self.perception.state_label())
                 self.state.set(mood=self.perception.mood)
                 if ev:
                     self.state.set(last_event=ev.text)
                     self.on_event(ev)
 
                 if self.state.preview:
-                    self._draw(frame, fr, gr, gesture, yaw)
+                    self._draw(frame, fr, gr, gesture)
                     cv2.imshow("Nuonuo preview (P to hide)", frame)
                     preview_open = True
                     if cv2.waitKey(1) & 0xFF in (ord("p"), ord("P")):
@@ -161,7 +165,7 @@ class VisionWorker(threading.Thread):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         return cap
 
-    def _draw(self, frame, fr, gr, gesture, yaw) -> None:
+    def _draw(self, frame, fr, gr, gesture) -> None:
         h, w = frame.shape[:2]
         for lm in fr.face_landmarks[:1]:
             for p in lm[::4]:
@@ -170,8 +174,14 @@ class VisionWorker(threading.Thread):
             for p in hand:
                 cv2.circle(frame, (int(p.x * w), int(p.y * h)), 3, (255, 128, 0), -1)
         p = self.perception
+        if p.yaw_smooth is None:
+            pose_line = f"mood={p.mood} (no face)"
+        elif p.pitch_smooth is None:
+            pose_line = f"mood={p.mood} yaw={p.yaw_smooth:.0f}"
+        else:
+            pose_line = f"mood={p.mood} yaw={p.yaw_smooth:.0f} pitch={p.pitch_smooth:.0f}"
         lines = [
-            f"mood={p.mood} yaw={yaw:.0f}" if yaw is not None else f"mood={p.mood} (no face)",
+            pose_line,
             f"smile={p._pair('mouthSmile'):.2f} blink={p._pair('eyeBlink'):.2f} jaw={p.s('jawOpen'):.2f}",
             f"gesture={gesture}",
             " ".join(k for k, d in p.states.items() if d.value),

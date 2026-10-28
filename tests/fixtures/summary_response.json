@@ -1,0 +1,13 @@
+{
+  "output": [
+    {
+      "type": "message",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"summary\": \"Last time Andy was tired and talked about his oral exam.\", \"topics\": [\"oral exam\"], \"mood_trend\": \"tired\", \"follow_ups\": [\"ask how the exam went\"]}"
+        }
+      ]
+    }
+  ]
+}

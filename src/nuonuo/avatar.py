@@ -7,7 +7,7 @@ import pygame
 
 from nuonuo.state import SharedState
 
-SIZE = (260, 300)
+SIZE = (280, 318)
 BG = (255, 236, 244)
 SKIN = (255, 224, 210)
 HAIR = (120, 70, 160)
@@ -94,10 +94,15 @@ def run_avatar(state: SharedState) -> None:
                         state.set(vision_enabled=not state.vision_enabled)
                     elif e.key == pygame.K_p:
                         state.set(preview=not state.preview)
+                    elif e.key == pygame.K_m:
+                        current = state.snapshot()["mode"]
+                        state.set(mode="quiet" if current == "chatty" else "chatty")
             s = state.snapshot()
             mood = s["mood"] if s["vision_enabled"] else "neutral"
             draw_face(screen, mood, s["speaking"], s["mouth_level"], time.monotonic() - t0)
-            info = f"{s['status']} | vision {'on' if s['vision_enabled'] else 'off'} (V) | P preview"
+            mode = s["mode"] if s["mode"] in ("chatty", "quiet") else "chatty"
+            screen.blit(font.render(f"{s['status']}  {mode} (M)", True, (90, 60, 110)), (6, SIZE[1] - 34))
+            info = f"vision {'on' if s['vision_enabled'] else 'off'} (V)   P preview"
             screen.blit(font.render(info, True, (90, 60, 110)), (6, SIZE[1] - 18))
             if s["last_event"]:
                 screen.blit(font.render(s["last_event"][:40], True, (140, 100, 160)), (6, 4))

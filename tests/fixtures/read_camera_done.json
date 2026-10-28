@@ -1,0 +1,13 @@
+{
+  "type": "response.done",
+  "response": {
+    "output": [
+      {
+        "type": "function_call",
+        "name": "read_camera",
+        "call_id": "call_test_camera",
+        "arguments": "{}"
+      }
+    ]
+  }
+}

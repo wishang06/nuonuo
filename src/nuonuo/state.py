@@ -10,6 +10,7 @@ class SharedState:
     mouth_level: float = 0.0
     vision_enabled: bool = True
     preview: bool = False
+    mode: str = "chatty"
     status: str = "starting"
     last_event: str = ""
     stop: threading.Event = field(default_factory=threading.Event)
@@ -29,6 +30,7 @@ class SharedState:
                 "mouth_level": self.mouth_level,
                 "vision_enabled": self.vision_enabled,
                 "preview": self.preview,
+                "mode": self.mode,
                 "status": self.status,
                 "last_event": self.last_event,
             }

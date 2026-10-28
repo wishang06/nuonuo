@@ -1,0 +1,164 @@
+{
+  "steps": [
+    {
+      "t_ms": 0,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 60000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 60000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 120000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 120000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 180000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 180000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 240000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 240000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 300000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 300000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 360000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 360000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 420000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 420000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 480000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 480000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 540000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 540000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 600000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 600000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 660000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 660000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 720000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 720000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 780000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 780000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 840000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 840000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 900000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 900000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 960000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 960000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 1020000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 1020000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 1080000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 1080000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 1140000,
+      "state": "smiling"
+    },
+    {
+      "t_ms": 1140000,
+      "state": "looking_away"
+    },
+    {
+      "t_ms": 1200000,
+      "state": "looking_away"
+    }
+  ]
+}

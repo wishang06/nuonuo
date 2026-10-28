@@ -1,6 +1,7 @@
 .env
 .venv/
 logs/
+data/
 models/*.task
 __pycache__/
 *.pyc

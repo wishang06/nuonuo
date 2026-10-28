@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {"t_ms": 0, "state": "smiling"},
+    {"t_ms": 1000, "state": "smiling"},
+    {"t_ms": 1500, "state": "looking_away"},
+    {"t_ms": 2000, "state": "looking_away"}
+  ]
+}
