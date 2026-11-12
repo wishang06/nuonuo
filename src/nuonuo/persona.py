@@ -1,4 +1,96 @@
-def build_instructions(user_name: str = "Andy", memories: list[str] | None = None, mode: str = "chatty") -> str:
+from collections import deque
+
+RECAP_TURNS = 6
+RECAP_TURN_CHARS = 220
+RECAP_TOPIC_CHARS = 160
+RECAP_MERGE_MS = 1500
+TOPIC_MIN_WORDS = 4
+
+
+def _squash(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+class ConversationRecap:
+    """The last few turns and the current topic, kept in memory for the next live session.
+
+    A live session can drop or expire in the middle of a conversation. The next session.start
+    carries this recap, so Nuonuo picks up the thread instead of starting over.
+    The topic is the latest user turn with at least TOPIC_MIN_WORDS words, so a short
+    "yeah" or "okay" does not replace what the conversation is about.
+    """
+
+    def __init__(self, max_turns: int = RECAP_TURNS, merge_ms: int = RECAP_MERGE_MS):
+        self.turns: deque[dict] = deque(maxlen=max_turns)
+        self.topic = ""
+        self.merge_ms = merge_ms
+
+    def add(self, role: str, text: str, start_ms: int, end_ms: int | None = None) -> None:
+        """Add a transcript delta. Deltas from the same speaker close together merge into one turn."""
+        if not text:
+            return
+        end_ms = start_ms if end_ms is None else end_ms
+        last = self.turns[-1] if self.turns else None
+        if last is not None and last["role"] == role and start_ms - last["end_ms"] < self.merge_ms:
+            last["text"] += text
+            last["end_ms"] = max(last["end_ms"], end_ms)
+        else:
+            last = {"role": role, "text": text, "start_ms": start_ms, "end_ms": end_ms}
+            self.turns.append(last)
+        if role == "user":
+            spoken = _squash(last["text"])
+            if len(spoken.split()) >= TOPIC_MIN_WORDS:
+                self.topic = _clip(spoken, RECAP_TOPIC_CHARS)
+
+    def lines(self, user_name: str) -> list[str]:
+        out = []
+        for turn in self.turns:
+            text = _squash(turn["text"])
+            if text:
+                speaker = user_name if turn["role"] == "user" else "Nuonuo"
+                out.append(f"{speaker}: {_clip(text, RECAP_TURN_CHARS)}")
+        return out
+
+
+def resume_note(user_name: str, recap: ConversationRecap | None, resume: str) -> str:
+    """Instructions for a session that continues an earlier one.
+
+    resume="reconnect": the link dropped, expired, or hit the session cap mid-conversation. No greeting.
+    resume="wake": the user was away long enough for the session to close and has come back.
+    """
+    if resume == "wake":
+        lead = (
+            f"{user_name} stepped away for a while and has just come back. This is the same day and the "
+            "same conversation. A short, warm hello is fine, but don't introduce yourself again."
+        )
+    else:
+        lead = (
+            "This continues a conversation that is already under way. The voice link dropped for a moment "
+            f"and has just come back. Do not greet {user_name}, do not say hello or welcome back, do not "
+            "introduce yourself, and do not mention the connection. Carry on from the last turn as if "
+            f"nothing happened, or wait for {user_name} to speak."
+        )
+    parts = ["", "Picking up where you left off:", lead]
+    lines = recap.lines(user_name) if recap else []
+    if lines:
+        parts.append("Last few turns, oldest first:")
+        parts.extend(f"- {line}" for line in lines)
+    if recap and recap.topic:
+        parts.append(f'Current topic, in {user_name}\'s words: "{recap.topic}"')
+    return "\n".join(parts) + "\n"
+
+
+def build_instructions(
+    user_name: str = "Andy",
+    memories: list[str] | None = None,
+    mode: str = "chatty",
+    resume: str | None = None,
+    recap: ConversationRecap | None = None,
+) -> str:
     if mode == "quiet":
         visual = (
             f"Quiet mode: do not volunteer comments about what you see. "
@@ -18,6 +110,8 @@ def build_instructions(user_name: str = "Andy", memories: list[str] | None = Non
             f"\nRecent sessions, oldest first:\n{lines}\n"
             "Bring one of these up only when it fits. Don't recite the list.\n"
         )
+    if resume:
+        memory += resume_note(user_name, recap, resume)
     return f"""You are Nuonuo (糯糯), a lively, energetic, cute anime desktop companion who lives in a little window on {user_name}'s screen.
 
 Personality:

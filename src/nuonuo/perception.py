@@ -25,6 +25,16 @@ CONFIG = {
     "wave_min_amplitude": 0.03,
     "wave_min_reversals": 2,
     "wave_cooldown_seconds": 4.0,
+    # Detection cadence (vision.py). Face detection runs every detect_min..detect_max seconds
+    # instead of every frame: back to the minimum whenever something changes, and stretched by
+    # detect_slowdown after each calm detection. Readings are held between detections.
+    "detect_min_seconds": 0.15,
+    "detect_max_seconds": 0.5,
+    "detect_slowdown": 1.25,
+    "detect_motion": 0.05,  # face centre moving this far (in -1..1 frame units) counts as a change
+    "gesture_every": 4,  # run the gesture recognizer on every Nth detection
+    "gesture_boost_with_hand": True,  # ...and on every detection while a hand is in view, so waves still register
+    "face_hold_seconds": 0.75,  # keep the last face position through a missed detection
 }
 
 GESTURE_PHRASES = {
@@ -259,7 +269,10 @@ class Perception:
         gesture: str | None = None,
         wrist_x: float | None = None,
         pitch: float | None = None,
+        hand_fresh: bool = True,
     ) -> PerceptionEvent | None:
+        """hand_fresh=False means the gesture recognizer did not run on this frame.
+        Gesture tracking then keeps its last state instead of treating the hand as gone."""
         dt = 0.033 if self.last_t is None else max(t - self.last_t, 1e-3)
         self.last_t = t
         face = blend is not None
@@ -273,7 +286,8 @@ class Perception:
             self.pitch_smooth = None
             yaw = pitch = None
         kinds = self._debounce(t, self._raw_states(t, face, yaw, pitch))
-        kinds += self._gestures(t, gesture, wrist_x)
+        if hand_fresh:
+            kinds += self._gestures(t, gesture, wrist_x)
         self._update_mood()
         kinds = [k for k in kinds if not (k.endswith("_end") and STATE_PHRASES[k[:-4]][1] is None)]
         if not kinds:
@@ -282,3 +296,76 @@ class Perception:
         if not text:
             return None
         return PerceptionEvent(text=text, kinds=kinds, salient=any(k in SALIENT for k in kinds))
+
+
+class DetectionScheduler:
+    """When vision.py runs face detection, and when it runs the gesture recognizer too.
+
+    Detection runs every detect_min..detect_max seconds instead of every frame. A detection
+    where something changed (the face appeared or left, moved, changed state, or raised an
+    event) sets the next interval to the minimum. A calm one stretches it by detect_slowdown,
+    up to the maximum. Gestures run on every gesture_every-th detection, and on every detection
+    while a hand is in view so a wave still gets enough wrist samples.
+    """
+
+    def __init__(self, cfg: dict | None = None):
+        self.cfg = dict(CONFIG) if cfg is None else cfg
+        self.interval = float(self.cfg["detect_min_seconds"])
+        self.next_at = float("-inf")
+        self.count = 0
+        self.hand = False
+        self._face: tuple[float, float] | None = None
+        self._label: str | None = None
+
+    def due(self, now: float) -> bool:
+        return now >= self.next_at
+
+    def gestures_due(self) -> bool:
+        if self.hand and self.cfg["gesture_boost_with_hand"]:
+            return True
+        return self.count % max(1, int(self.cfg["gesture_every"])) == 0
+
+    def done(
+        self,
+        now: float,
+        face: tuple[float, float] | None,
+        label: str,
+        event: bool = False,
+        hand: bool | None = None,
+    ) -> float:
+        """Record a finished detection and schedule the next. hand is None if gestures did not run."""
+        c = self.cfg
+        active = event or label != self._label or (face is None) != (self._face is None)
+        if face is not None and self._face is not None:
+            active = active or math.dist(face, self._face) > c["detect_motion"]
+        self._face, self._label = face, label
+        if hand is not None:
+            self.hand = hand
+        lo, hi = float(c["detect_min_seconds"]), float(c["detect_max_seconds"])
+        if active or (self.hand and c["gesture_boost_with_hand"]):
+            self.interval = lo
+        else:
+            self.interval = min(hi, max(lo, self.interval * float(c["detect_slowdown"])))
+        self.count += 1
+        self.next_at = now + self.interval
+        return self.interval
+
+
+class ReadingHold:
+    """Hold the last face position through a short gap so the avatar's gaze does not jump."""
+
+    def __init__(self, hold_seconds: float):
+        self.hold_seconds = hold_seconds
+        self.value: tuple[float, float] | None = None
+        self.at = float("-inf")
+
+    def update(self, now: float, value: tuple[float, float] | None) -> tuple[float, float] | None:
+        if value is not None:
+            self.value, self.at = value, now
+        elif self.value is not None and now - self.at > self.hold_seconds:
+            self.value = None
+        return self.value
+
+    def clear(self) -> None:
+        self.value = None
+        self.at = float("-inf")
