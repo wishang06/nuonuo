@@ -68,7 +68,10 @@ class SessionLogger:
         self.start = time.monotonic()
         self.events: dict[str, dict] = {}
         self.flushed = 0
-        self.voice_seconds = None
+        self.voice_seconds = None  # latest cumulative total reported by the open live session
+        self._voice_total = 0.0  # summed over live sessions that have ended
+        self._voice_reported = False
+        self.voice_sessions: list[dict] = []
         self.lock = threading.Lock()
 
     def _flush(self, force: bool = False) -> None:
@@ -107,17 +110,42 @@ class SessionLogger:
     def set_voice_seconds(self, seconds: float) -> None:
         with self.lock:
             self.voice_seconds = seconds
+            self._voice_reported = True
+
+    def voice_session_ended(self, seconds: float, reason: str) -> None:
+        """Record one live session: wall-clock minutes it was open and why it ended."""
+        with self.lock:
+            self.voice_sessions.append(
+                {
+                    "end": _now(),
+                    "minutes": round(seconds / 60, 2),
+                    "reason": reason,
+                    "voice_seconds": self.voice_seconds,
+                }
+            )
+            if self.voice_seconds is not None:
+                self._voice_total += self.voice_seconds
+            self.voice_seconds = None
+
+    def voice_minutes(self) -> float:
+        with self.lock:
+            return round(sum(entry["minutes"] for entry in self.voice_sessions), 2)
 
     def close(self) -> dict:
         with self.lock:
             self._flush(force=True)
+            voice_seconds = None
+            if self._voice_reported:
+                voice_seconds = self._voice_total + (self.voice_seconds or 0.0)
             summary = {
                 "model": self.model,
                 "start": self.start_wall,
                 "end": _now(),
                 "duration_seconds": round(time.monotonic() - self.start, 1),
                 "usage": self.usage.as_dict(),
-                "voice_seconds": self.voice_seconds,
+                "voice_seconds": voice_seconds,
+                "voice_minutes": round(sum(entry["minutes"] for entry in self.voice_sessions), 2),
+                "voice_sessions": list(self.voice_sessions),
                 "estimated_cost_usd": round(self.usage.cost(self.model), 5),
                 "rates_per_million": rates_for(self.model),
                 "vision_events": self.flushed,

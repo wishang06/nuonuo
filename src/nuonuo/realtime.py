@@ -1,4 +1,10 @@
-"""GPT-Live voice session over a primary WebSocket."""
+"""GPT-Live voice session over a primary WebSocket, reopened when it drops or expires.
+
+The mic stream, speaker, and session clock live for the whole app run. Live sessions open and
+close underneath them: the wake gate (gate.py) decides when one should be open, and a dropped or
+expired session is reopened with exponential backoff. Each new session.start carries a short recap
+(persona.ConversationRecap) so Nuonuo picks up the conversation instead of greeting again.
+"""
 
 import asyncio
 import base64
@@ -13,6 +19,7 @@ import sounddevice as sd
 import websockets
 
 from nuonuo.clock import SessionClock
+from nuonuo.gate import AWAKE, VoiceGate
 from nuonuo.logs import SessionLogger
 from nuonuo.notes import (
     READ_CAMERA_TOOL,
@@ -26,18 +33,56 @@ from nuonuo.notes import (
     thinking_append,
 )
 from nuonuo.perception import PerceptionEvent
-from nuonuo.persona import build_backend_instructions, build_instructions, mode_update
+from nuonuo.persona import ConversationRecap, build_backend_instructions, build_instructions, mode_update
 from nuonuo.state import SharedState
 from nuonuo.timeline import BehaviourTimeline, read_camera
 
 log = logging.getLogger("nuonuo.live")
 
 LIVE_URL = "wss://api.openai.com/v1/live/sessions"
+DEFAULT_VOICE = "marin"  # a voice name the server does not accept is refused with "forbidden"
 RATE = 24000
 CHUNK = 480  # 20 ms
 SALIENT_RESPONSE_COOLDOWN = 6.0
 USER_SPEECH_GAP = 0.8
 NOTE_LIMIT = 1800
+
+BACKOFF_START = 1.0
+BACKOFF_MAX = 30.0
+BACKOFF_RESET_AFTER = 30.0  # a session that stayed up this long starts the next backoff at 1 s again
+START_TIMEOUT = 15.0  # seconds to wait for session.started before treating the attempt as failed
+CLOSE_WAIT = 5.0  # seconds to wait for session.closed after asking to close
+CLOSE_WAIT_UNSTARTED = 1.0  # the same wait when session.started never arrived
+OPEN_TIMEOUT = 6.0  # websocket handshake limit, shorter than the app's shutdown join so quitting never outruns it
+GATE_POLL = 0.2
+MIC_WAKE_RMS = 0.03  # mic level that counts as speech for waking her when there is no camera
+HEARD_GAP = 0.3
+VISION_STALE = 3.0  # a face reading older than this is ignored (the camera stopped sending frames)
+
+# Session end reasons that reopen with backoff. Gate reasons ("idle", "session_cap", "daily_cap")
+# reopen when the gate wakes again, and "stop" ends the run.
+# "resumed": the machine slept with a session open. The server has likely dropped it, so reopen now
+# rather than wait ~40 s for the websocket keepalive to notice.
+RETRY_REASONS = frozenset({"dropped", "server_closed", "denied", "start_timeout", "resumed"})
+# Expected ways for a connection to fail. TimeoutError and socket errors are OSError subclasses.
+NETWORK_ERRORS = (OSError, websockets.ConnectionClosed, websockets.InvalidHandshake, json.JSONDecodeError)
+
+
+class Backoff:
+    """Reconnect delays: 1 s, 2 s, 4 s, ... capped at 30 s."""
+
+    def __init__(self, start: float = BACKOFF_START, cap: float = BACKOFF_MAX):
+        self.start = start
+        self.cap = cap
+        self.attempt = 0
+
+    def next(self) -> float:
+        delay = min(self.cap, self.start * (2 ** self.attempt))
+        self.attempt += 1
+        return delay
+
+    def reset(self) -> None:
+        self.attempt = 0
 
 
 class Player:
@@ -88,6 +133,10 @@ class Player:
         self.stream.close()
 
 
+def open_mic(callback):
+    return sd.RawInputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=CHUNK, callback=callback)
+
+
 class RealtimeClient:
     def __init__(
         self,
@@ -101,6 +150,12 @@ class RealtimeClient:
         clock: SessionClock | None = None,
         memories: list[str] | None = None,
         backend_model: str = "gpt-6-luna",
+        *,
+        gate: VoiceGate | None = None,
+        connect=None,
+        player_factory=Player,
+        mic_factory=open_mic,
+        backoff: Backoff | None = None,
     ):
         self.state = state
         self.api_key = api_key
@@ -112,8 +167,14 @@ class RealtimeClient:
         self.clock = clock or SessionClock()
         self.memories = list(memories or [])
         self.backend_model = backend_model
+        self.gate = gate or VoiceGate(now=time.monotonic())
+        self.backoff = backoff or Backoff()
+        self._connect = connect or websockets.connect
+        self._player_factory = player_factory
+        self._mic_factory = mic_factory
         self.notes = NoteGate()
         self.remarks = RemarkGate()
+        self.recap = ConversationRecap()
         self.transcript: list[dict] = []
         self.note_log: list[dict] = []
         self.loop: asyncio.AbstractEventLoop | None = None
@@ -124,68 +185,243 @@ class RealtimeClient:
         self.user_speaking = False
         self.last_user_transcript = 0.0
         self.last_salient_response = 0.0
+        self.last_heard = float("-inf")
         self.answered_calls: set[str] = set()
         self._mode_sent: str | None = None
         self._tick_queued = False
         self.player: Player | None = None
+        self._closing: str | None = None
+        self._end_reason: str | None = None
+        self._started_at: float | None = None
+        self._last_uptime = 0.0
+        self._end_lock = threading.Lock()
+        self.configured_voice = voice
+        self._fallback_unproven = False  # fell back to the default voice, and it has not started a session yet
+        self._session_base_ms = 0  # app-clock time at which the current live session started
+        self._new_session_turn = False  # the next transcript delta is the first of a new live session
+
+    def _now(self) -> float:
+        return time.monotonic()
 
     def submit_vision(self, ev: PerceptionEvent) -> None:
-        if self.loop and self.out_q:
-            self.loop.call_soon_threadsafe(self.out_q.put_nowait, ("vision", ev))
+        loop = self.loop
+        if loop is not None and self.out_q is not None:
+            try:
+                loop.call_soon_threadsafe(self._put_vision, ev)
+            except RuntimeError:
+                pass  # loop already closed during shutdown
+
+    def _put_vision(self, ev: PerceptionEvent) -> None:
+        # Nothing to tell a session that isn't open. Stale events are dropped, not replayed later.
+        if self.out_q is not None and self.started.is_set() and not self.closed:
+            self.out_q.put_nowait(("vision", ev))
+
+    def _mic_cb(self, indata, frames, time_info, status):
+        blob = bytes(indata)
+        if len(blob) >= 2:
+            samples = np.frombuffer(blob[: len(blob) // 2 * 2], dtype=np.int16).astype(np.float32) / 32768
+            if float(np.sqrt(np.mean(samples**2))) > MIC_WAKE_RMS:
+                self.last_heard = self._now()
+        loop = self.loop
+        if loop is not None:
+            try:
+                loop.call_soon_threadsafe(self._put_mic, blob)
+            except RuntimeError:
+                pass
+
+    def _put_mic(self, blob: bytes) -> None:
+        if self.mic_q is not None and self.started.is_set() and not self.closed and not self.mic_q.full():
+            self.mic_q.put_nowait(blob)
 
     async def run(self) -> None:
+        """Keep a live session open whenever the gate wants one, until the app stops."""
         self.loop = asyncio.get_running_loop()
         self.out_q = asyncio.Queue()
         self.mic_q = asyncio.Queue(maxsize=200)
-        headers = {"Authorization": f"Bearer {self.api_key}"}
-        self.state.set(status="connecting")
-        async with websockets.connect(LIVE_URL, additional_headers=headers, max_size=None) as ws:
-            await self._send(ws, self._session_start())
-            self.player = Player(self.state)
-            self.player.start()
-
-            def mic_cb(indata, frames, time_info, status):
-                self.loop.call_soon_threadsafe(_put, bytes(indata))
-
-            def _put(blob: bytes):
-                if self.mic_q is not None and not self.mic_q.full():
-                    self.mic_q.put_nowait(blob)
-
-            mic = sd.RawInputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=CHUNK, callback=mic_cb)
-            mic.start()
-            tasks = [
-                asyncio.create_task(self._mic_sender(ws)),
-                asyncio.create_task(self._out_sender(ws)),
-                asyncio.create_task(self._receiver(ws)),
-                asyncio.create_task(self._stop_watch(ws)),
-                asyncio.create_task(self._tick()),
-            ]
+        self.player = self._player_factory(self.state)
+        self.player.start()
+        mic = self._mic_factory(self._mic_cb)
+        mic.start()
+        try:
+            await self._supervise()
+        finally:
+            self.finish()
             try:
-                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                for task in pending:
-                    task.cancel()
-                for task in done:
-                    if task.exception():
-                        raise task.exception()
-            finally:
                 mic.stop()
                 mic.close()
+            finally:
                 self.player.close()
-                if not self.started.is_set() and self.state.snapshot()["status"] == "connecting":
-                    self.state.set(status="voice offline")
+
+    async def _supervise(self) -> None:
+        resume: str | None = None  # how the next session.start frames the recap; None for the first one
+        while not self.state.stop.is_set():
+            if not await self._wait_until_awake():
+                return
+            reason = await self._run_session(resume)
+            if self.state.stop.is_set() or reason == "stop":
+                return
+            if reason == "voice_refused":
+                continue  # the voice is now the default: try again right away, no backoff
+            started = self._last_uptime > 0
+            if reason in RETRY_REASONS:
+                if self._last_uptime >= BACKOFF_RESET_AFTER:
+                    self.backoff.reset()
+                delay = self.backoff.next()
+                if started:
+                    resume = "reconnect"
+                label = "voice denied, retry" if reason == "denied" else "reconnecting"
+                log.warning("live session ended (%s); reopening in %.0fs", reason, delay)
+                self.state.set(status=f"{label} in {delay:.0f}s", speaking=False)
+                await self._sleep(delay)
+            else:
+                self.backoff.reset()
+                if started:
+                    resume = "reconnect" if reason == "session_cap" else "wake"
+
+    async def _sleep(self, seconds: float) -> None:
+        """Sleep, waking early if the app is stopping."""
+        end = self._now() + seconds
+        while not self.state.stop.is_set():
+            left = end - self._now()
+            if left <= 0:
+                return
+            await asyncio.sleep(min(left, 0.1))
+
+    def _observe_gate(self) -> str:
+        snap = self.state.snapshot()
+        now = self._now()
+        face = snap["face_present"] if snap["vision_enabled"] else None
+        seen = snap["vision_ts"]
+        if face is not None and seen is not None and now - seen > VISION_STALE:
+            face = None  # don't keep her awake (or asleep) on a reading from a camera that went quiet
+        speech = self.user_speaking or self._assistant_speaking()
+        return self.gate.observe(now, face, speech, now - self.last_heard < HEARD_GAP)
+
+    async def _wait_until_awake(self) -> bool:
+        shown = None
+        while not self.state.stop.is_set():
+            if self._observe_gate() == AWAKE:
+                return True
+            status = self.gate.status()
+            if status != shown:
+                self.state.set(status=status)
+                shown = status
+            await asyncio.sleep(GATE_POLL)
+        return False
+
+    async def _run_session(self, resume: str | None) -> str:
+        """Open one live session and serve it until it ends. Returns why it ended."""
+        self.started.clear()
+        self.closed = False
+        self._closing = None
+        self._end_reason = None
+        self._last_uptime = 0.0
+        self.state.set(status="connecting" if resume is None else "reconnecting")
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        try:
+            connecting = self._connect(
+                LIVE_URL, additional_headers=headers, max_size=None, open_timeout=OPEN_TIMEOUT
+            )
+            async with connecting as ws:
+                if self.state.stop.is_set():
+                    self._end_reason = "stop"  # the app quit while the socket was opening: start nothing
+                else:
+                    await self._send(ws, self._session_start(resume))
+                    await self._serve(ws)
+                    # Book the minutes now. Leaving this block waits for the websocket close handshake,
+                    # which can take a couple of seconds and is not voice time.
+                    self._end_session()
+        except asyncio.CancelledError:
+            if self._end_reason is None:
+                self._end_reason = "cancelled"
+            raise
+        except Exception as exc:
+            if self._end_reason is None:
+                self._end_reason = "dropped"
+                if isinstance(exc, NETWORK_ERRORS):
+                    log.warning("live connection lost: %s", str(exc) or type(exc).__name__)
+                else:
+                    # Still reconnect so the app stays up, but a bug should not hide behind "connection lost".
+                    log.exception("live session failed unexpectedly; reconnecting")
+        finally:
+            self._end_session()
+        return self._end_reason or "dropped"
+
+    async def _serve(self, ws) -> None:
+        tasks = [
+            asyncio.create_task(self._mic_sender(ws)),
+            asyncio.create_task(self._out_sender(ws)),
+            asyncio.create_task(self._receiver(ws)),
+            asyncio.create_task(self._watch(ws)),
+            asyncio.create_task(self._tick()),
+        ]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            await self._close_quietly(ws)
+            raise
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for task in done:
+            if task.exception() is not None:
+                raise task.exception()
+
+    async def _close_quietly(self, ws) -> None:
+        """On cancel, still ask the server to close so it doesn't hold the session open."""
+        self._closing = self._closing or "cancelled"
+        if self._end_reason is None:
+            self._end_reason = "cancelled"
+        if not self.started.is_set() or self.closed:
+            return
+        try:
+            close = {"type": "session.close", "event_id": self._event_id("close")}
+            await asyncio.wait_for(asyncio.shield(self._send(ws, close)), 1.0)
+        except BaseException:
+            pass
+
+    def _end_session(self) -> None:
+        """Book the session's minutes and log them. Safe to call more than once, from any thread."""
+        with self._end_lock:
+            started_at, self._started_at = self._started_at, None
+        if started_at is None:
+            return
+        now = self._now()
+        seconds = self.gate.session_closed(now)
+        self._last_uptime = max(now - started_at, 1e-6)
+        reason = self._end_reason or ("stop" if self.state.stop.is_set() else "dropped")
+        self.logger.voice_session_ended(seconds, reason)
+        cap = self.gate.cfg.daily_cap_seconds
+        log.info(
+            "voice session ended (%s): %.1f min used, %.1f of %s min today",
+            reason,
+            seconds / 60,
+            self.gate.usage.used() / 60,
+            f"{cap / 60:g}" if cap > 0 else "unlimited",
+        )
+        self.user_speaking = False
+        self.state.set(user_speaking=False)
+
+    def finish(self) -> None:
+        """Book an open session's minutes. Called at shutdown in case the voice thread is still closing."""
+        self._end_session()
 
     def _mode(self) -> str:
         mode = self.state.snapshot()["mode"]
         return mode if mode in ("chatty", "quiet") else "chatty"
 
-    def _session_start(self) -> dict:
+    def _session_start(self, resume: str | None = None) -> dict:
         self._mode_sent = self._mode()
+        instructions = build_instructions(
+            self.user_name, self.memories, self._mode_sent, resume=resume, recap=self.recap
+        )
         return {
             "type": "session.start",
             "event_id": "event_start",
             "session": {
                 "model": self.model,
-                "instructions": build_instructions(self.user_name, self.memories, self._mode_sent),
+                "instructions": instructions,
                 "audio": {
                     "format": {"type": "audio/pcm", "rate": RATE},
                     "output": {"voice": self.voice},
@@ -215,15 +451,45 @@ class RealtimeClient:
             return text
         return text[: NOTE_LIMIT - 1].rstrip() + "…"
 
-    async def _stop_watch(self, ws):
-        while not self.state.stop.is_set() and not self.closed:
+    async def _watch(self, ws) -> None:
+        """Close the session when the app stops or the gate says so, and give up on a start that hangs."""
+        opened = self._now()
+        while True:
+            if self.closed:
+                return
+            if self.state.stop.is_set():
+                reason = "stop"
+                break
+            if self._observe_gate() != AWAKE:
+                reason = self.gate.reason or "idle"
+                break
+            resumed = self.gate.resumed_at
+            if resumed is not None and self._started_at is not None and resumed > self._started_at:
+                log.info("woke from sleep with a live session open; reopening it")
+                reason = "resumed"
+                break
+            if not self.started.is_set() and self._now() - opened > START_TIMEOUT:
+                log.warning("live session did not start within %.0fs", START_TIMEOUT)
+                reason = "start_timeout"
+                break
+            await asyncio.sleep(GATE_POLL)
+        await self._request_close(ws, reason)
+
+    async def _request_close(self, ws, reason: str) -> None:
+        self._closing = reason
+        if self._end_reason is None:
+            self._end_reason = reason
+        if self.closed:
+            return
+        started = self.started.is_set()
+        if started:
+            log.info("closing live session (%s)", reason)
+        # Sent even if session.started never arrived. The server may have opened the session without
+        # the reply reaching us, and it should not be left holding it.
+        await self._send(ws, {"type": "session.close", "event_id": self._event_id("close")})
+        deadline = self._now() + (CLOSE_WAIT if started else CLOSE_WAIT_UNSTARTED)
+        while not self.closed and self._now() < deadline:
             await asyncio.sleep(0.1)
-        if self.started.is_set() and not self.closed:
-            await self._send(ws, {"type": "session.close", "event_id": "event_close"})
-            for _ in range(50):
-                if self.closed:
-                    return
-                await asyncio.sleep(0.1)
 
     async def _mic_sender(self, ws):
         await self.started.wait()
@@ -330,22 +596,47 @@ class RealtimeClient:
         delta = event.get("delta") or ""
         if not delta:
             return
-        start_ms = int(event.get("start_ms") or self.clock.t_ms())
-        end_ms = int(event.get("end_ms") or start_ms)
-        if self.transcript and self.transcript[-1]["role"] == role and start_ms - int(self.transcript[-1].get("end_ms", start_ms)) < 1500:
-            self.transcript[-1]["text"] += delta
-            self.transcript[-1]["end_ms"] = end_ms
+        # The server's start_ms and end_ms count from the start of its own live session, so they
+        # restart near zero after a reconnect. Shift them onto the app clock: one timeline for the run.
+        if event.get("start_ms") is not None:
+            start_ms = self._session_base_ms + int(event["start_ms"])
+            end_ms = self._session_base_ms + int(event.get("end_ms") or event["start_ms"])
+        else:
+            start_ms = end_ms = self.clock.t_ms()
+        # The first delta of a new live session always starts a new turn. It must not be glued onto
+        # the last turn of the session before it.
+        fresh, self._new_session_turn = self._new_session_turn, False
+        last = self.transcript[-1] if self.transcript else None
+        if last is not None and not fresh and last["role"] == role and start_ms - int(last.get("end_ms", start_ms)) < 1500:
+            last["text"] += delta
+            last["end_ms"] = end_ms
         else:
             self.transcript.append({"role": role, "text": delta, "t_ms": start_ms, "end_ms": end_ms})
+        self.recap.add(role, delta, start_ms, end_ms, new_turn=fresh)
         log.info("%s: %s", "You" if role == "user" else "Nuonuo", delta)
 
     def _mark_started(self) -> None:
-        if self.mic_q is not None:
-            while True:
-                try:
-                    self.mic_q.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+        for queue in (self.mic_q, self.out_q):
+            while queue is not None and not queue.empty():
+                queue.get_nowait()
+        self._tick_queued = False
+        if self.state.stop.is_set():
+            # The app is quitting. Shutdown may already have booked the minutes, so don't open the
+            # books again: leave the session unmarked and let _watch ask the server to close it.
+            return
+        # Send the current camera note on the first tick, so the new session knows what she sees.
+        self.notes.rearm()
+        self._session_base_ms = self.clock.t_ms()
+        self._new_session_turn = True
+        if self._fallback_unproven:
+            self._fallback_unproven = False
+            log.warning(
+                "Voice %r works where %r was refused; using it for this run.", self.voice, self.configured_voice
+            )
+        now = self._now()
+        with self._end_lock:
+            self._started_at = now
+            self.gate.session_opened(now)
         self.started.set()
         self.state.set(status="listening")
 
@@ -392,7 +683,9 @@ class RealtimeClient:
                     self.logger.set_voice_seconds(float(seconds))
                 log.info("live session closed (%s)", ev.get("reason", ""))
                 self.closed = True
-                self.state.set(speaking=False, status="listening")
+                if self._end_reason is None:
+                    self._end_reason = self._closing or "server_closed"
+                self.state.set(speaking=False)
                 return
             elif kind == "error":
                 err = ev.get("error", ev)
@@ -400,15 +693,39 @@ class RealtimeClient:
                 message = err.get("message") if isinstance(err, dict) else str(err)
                 log.warning("live error: %s", err)
                 if code == "forbidden":
-                    log.error(
-                        "OpenAI refused the voice session (%s). "
-                        "A previous run may still be holding one, or this API key cannot open GPT-Live. "
-                        "Wait a minute and start again. The avatar keeps running.",
-                        message,
-                    )
                     self.closed = True
-                    self.state.set(status="voice denied")
+                    if self.voice != DEFAULT_VOICE:
+                        # The server answers "forbidden: Voice session access denied." for any voice
+                        # name it does not accept, so try the default voice before giving up.
+                        log.warning(
+                            "OpenAI refused the voice session (%s) with voice %r. It answers this way for a "
+                            "voice name it does not accept. Falling back to %r. Set NUONUO_VOICE=%s in .env "
+                            "to skip this.",
+                            message,
+                            self.voice,
+                            DEFAULT_VOICE,
+                            DEFAULT_VOICE,
+                        )
+                        self.voice = DEFAULT_VOICE
+                        self._fallback_unproven = True
+                        self._end_reason = "voice_refused"
+                    else:
+                        if self._fallback_unproven:
+                            # The default voice was refused as well, so the voice name is not the reason.
+                            # Go back to the configured voice rather than replace it for the whole run.
+                            self._fallback_unproven = False
+                            self.voice = self.configured_voice
+                        log.error(
+                            "OpenAI refused the voice session (%s) with the default voice. "
+                            "A previous run may still be holding one, or this API key cannot open GPT-Live. "
+                            "Retrying with backoff. The avatar keeps running.",
+                            message,
+                        )
+                        self._end_reason = "denied"
+                        self.state.set(status="voice denied")
                     return
+        if self._end_reason is None:
+            self._end_reason = self._closing or "dropped"
 
 
 def run_realtime_thread(client: RealtimeClient) -> threading.Thread:

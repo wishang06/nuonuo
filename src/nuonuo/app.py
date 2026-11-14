@@ -3,10 +3,12 @@ import logging
 import os
 import signal
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from nuonuo.shutdown import run_to_completion
 from nuonuo.state import SharedState
 
 log = logging.getLogger("nuonuo")
@@ -57,6 +59,36 @@ def _persist(memory, clock, timeline, client, user: str, api_key: str | None) ->
     memory.save_session(record)
 
 
+RT_JOIN_SECONDS = 8.0  # the voice thread may wait up to 5 s for session.closed
+
+
+def _finish(vision, rt_thread, client, memory, clock, timeline, user: str, api_key: str | None, slog) -> dict:
+    """Stop the workers, save the session, and write the session log.
+
+    The log is written in a finally block, so it lands even if the save fails. main() runs this
+    through run_to_completion, so Ctrl+C during the summary call or the database write cannot cut it short.
+    """
+    try:
+        vision.join(timeout=3)
+        if rt_thread is not None:
+            rt_thread.join(timeout=RT_JOIN_SECONDS)
+        if client is not None:
+            client.finish()
+        _persist(memory, clock, timeline, client, user, api_key)
+    except Exception:
+        log.exception("Could not save session memory")
+    finally:
+        summary = slog.close()
+        log.info(
+            "Session: %.0fs, %.1f voice min, est. cost $%.4f -> %s",
+            summary["duration_seconds"],
+            summary["voice_minutes"],
+            summary["estimated_cost_usd"],
+            slog.session_path,
+        )
+    return summary
+
+
 def main(argv=None) -> None:
     root = project_root()
     load_dotenv(root / ".env")
@@ -102,19 +134,24 @@ def main(argv=None) -> None:
         if not key or key.startswith("sk-your"):
             log.error("OPENAI_API_KEY missing; set it in .env or use --no-voice")
             sys.exit(1)
-        from nuonuo.realtime import RealtimeClient, run_realtime_thread
+        from nuonuo.gate import DailyUsage, GateConfig, VoiceGate
+        from nuonuo.realtime import DEFAULT_VOICE, RealtimeClient, run_realtime_thread
 
+        gate_cfg = GateConfig.from_env()
+        usage = DailyUsage(root / "data" / "voice_usage.json")
+        log.info("Voice gate: %s. %.1f voice min used today.", gate_cfg.describe(), usage.used() / 60)
         client = RealtimeClient(
             state,
             key,
             model,
-            os.getenv("NUONUO_VOICE", "marin"),
+            os.getenv("NUONUO_VOICE") or DEFAULT_VOICE,
             user,
             slog,
             timeline,
             clock,
             memories,
             os.getenv("NUONUO_BACKEND_MODEL", "gpt-6-luna"),
+            gate=VoiceGate(gate_cfg, usage, now=time.monotonic()),
         )
         rt_thread = run_realtime_thread(client)
     else:
@@ -141,20 +178,13 @@ def main(argv=None) -> None:
         pass
     finally:
         state.stop.set()
-        vision.join(timeout=3)
-        if rt_thread:
-            rt_thread.join(timeout=3)
+        # From here on Ctrl+C raises KeyboardInterrupt again, and run_to_completion holds it back
+        # until the save and the session log are written.
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         try:
-            _persist(memory, clock, timeline, client, user, key)
-        except Exception:
-            log.exception("Could not save session memory")
-        summary = slog.close()
-        log.info(
-            "Session: %.0fs, est. cost $%.4f -> %s",
-            summary["duration_seconds"],
-            summary["estimated_cost_usd"],
-            slog.session_path,
-        )
+            run_to_completion(_finish, vision, rt_thread, client, memory, clock, timeline, user, key, slog)
+        except KeyboardInterrupt:
+            log.info("Interrupted during shutdown; the session was saved first.")
 
 
 if __name__ == "__main__":

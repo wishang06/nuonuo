@@ -51,6 +51,11 @@ class NoteGate:
         self.last_sent_ms = now_ms
         return NoteDecision(True, changed)
 
+    def rearm(self) -> None:
+        """Send on the next call. A new live session knows nothing yet, but the scene itself has not
+        changed, so the note goes out as quiet context rather than as a fresh change to remark on."""
+        self.last_sent_ms = -1
+
 
 class RemarkGate:
     """Chatty may comment on a visual change at most about once a minute."""

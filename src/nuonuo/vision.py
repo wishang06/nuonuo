@@ -8,12 +8,16 @@ from typing import Callable
 import cv2
 
 from nuonuo.clock import SessionClock
-from nuonuo.perception import Perception, PerceptionEvent
+from nuonuo.perception import DetectionScheduler, Perception, PerceptionEvent, ReadingHold
 from nuonuo.pose import head_pose_from_matrix
 from nuonuo.state import SharedState
 from nuonuo.timeline import BehaviourTimeline
 
 log = logging.getLogger("nuonuo.vision")
+
+CAMERA_STALL_SECONDS = 2.0  # no frame for this long: release and reopen the webcam
+CAMERA_RETRY_SECONDS = 2.0
+IDLE_POLL_SECONDS = 0.05  # longest sleep between detections, so stop and the V/P keys are noticed quickly
 
 MODELS = {
     "face_landmarker.task": "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
@@ -60,7 +64,7 @@ class VisionWorker(threading.Thread):
             self._run()
         except Exception:
             log.exception("Vision worker crashed; continuing without vision")
-            self.state.set(status="vision error")
+            self.state.set(status="vision error", face_present=None)
         finally:
             cv2.destroyAllWindows()
 
@@ -87,10 +91,15 @@ class VisionWorker(threading.Thread):
                 num_hands=1,
             )
         )
+        cfg = self.perception.cfg
+        sched = DetectionScheduler(cfg)
+        hold = ReadingHold(float(cfg["face_hold_seconds"]))
         cap = None
         t0 = time.monotonic()
         last_ts = -1
         preview_open = False
+        last_frame = time.monotonic()
+        camera_lost = False
         try:
             while not self.state.stop.is_set():
                 if not self.state.vision_enabled:
@@ -100,53 +109,53 @@ class VisionWorker(threading.Thread):
                     if preview_open:
                         cv2.destroyAllWindows()
                         preview_open = False
+                    hold.clear()
+                    self.state.set(face_present=None, face_x=None, face_y=None)
                     time.sleep(0.2)
                     continue
                 if cap is None:
-                    cap = self._open_camera()
+                    try:
+                        cap = self._open_camera()
+                    except RuntimeError:
+                        if not camera_lost:
+                            log.warning("Could not open the webcam; retrying every %.0f s", CAMERA_RETRY_SECONDS)
+                            camera_lost = True
+                        self.state.set(face_present=None)
+                        time.sleep(CAMERA_RETRY_SECONDS)
+                        continue
+                    if camera_lost:
+                        log.info("Webcam is back")
+                        camera_lost = False
+                    last_frame = time.monotonic()
+                # With the debug preview open, detect on every frame so the overlay tracks the picture.
+                # The reduced cadence is for normal running, when nobody is watching the landmarks.
+                live = bool(self.state.preview)
+                now = time.monotonic()
+                if not sched.due(now, live=live):
+                    # Sleep until the next detection. Don't spin on cap.grab(): on DirectShow it returns
+                    # at once (hundreds of thousands of calls a second, a whole core). cap.read() waits
+                    # for the next new frame, so the frame read after this sleep is a current one.
+                    time.sleep(min(max(sched.next_at - now, 0.0), IDLE_POLL_SECONDS))
+                    continue
                 ok, frame = cap.read()
                 if not ok:
+                    if time.monotonic() - last_frame > CAMERA_STALL_SECONDS:
+                        # Common after the laptop sleeps: the device handle goes dead. Reopen it.
+                        log.warning("Webcam stopped sending frames; reopening it")
+                        cap.release()
+                        cap = None
+                        hold.clear()
+                        self.state.set(face_present=None, face_x=None, face_y=None)
                     time.sleep(0.05)
                     continue
+                last_frame = time.monotonic()
                 frame = cv2.flip(frame, 1)
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 now = time.monotonic()
                 ts = max(int((now - t0) * 1000), last_ts + 1)
                 last_ts = ts
-                fr = face.detect_for_video(image, ts)
-                gr = gest.recognize_for_video(image, ts)
+                fr, gr, gesture = self._detect(mp, face, gest, frame, now, ts, sched, hold, live)
 
-                blend = yaw = pitch = None
-                if fr.face_blendshapes:
-                    blend = {c.category_name: c.score for c in fr.face_blendshapes[0]}
-                    if fr.facial_transformation_matrixes:
-                        pose = head_pose_from_matrix(fr.facial_transformation_matrixes[0])
-                        if pose is not None:
-                            yaw, pitch, _roll = pose
-                gesture = wrist_x = None
-                if gr.gestures and gr.gestures[0]:
-                    top = gr.gestures[0][0]
-                    if top.score > 0.5 and top.category_name != "None":
-                        gesture = top.category_name
-                if gr.hand_landmarks:
-                    wrist_x = gr.hand_landmarks[0][0].x
-
-                ev = self.perception.update(now, blend, yaw, gesture, wrist_x, pitch)
-                if self.timeline is not None:
-                    self.timeline.observe(self.clock.t_ms(now), self.perception.state_label())
-                face_x = face_y = None
-                if fr.face_landmarks:
-                    pts = fr.face_landmarks[0]
-                    if pts:
-                        face_x = (sum(p.x for p in pts) / len(pts) - 0.5) * 2
-                        face_y = (sum(p.y for p in pts) / len(pts) - 0.5) * 2
-                self.state.set(mood=self.perception.mood, face_x=face_x, face_y=face_y)
-                if ev:
-                    self.state.set(last_event=ev.text)
-                    self.on_event(ev)
-
-                if self.state.preview:
+                if live:
                     self._draw(frame, fr, gr, gesture)
                     cv2.imshow("Nuonuo preview (P to hide)", frame)
                     preview_open = True
@@ -160,6 +169,60 @@ class VisionWorker(threading.Thread):
                 cap.release()
             face.close()
             gest.close()
+
+    def _detect(self, mp, face, gest, frame, now: float, ts: int, sched: DetectionScheduler, hold: ReadingHold, live: bool):
+        """One detection: face every time, gestures when the scheduler says so (always, in live mode).
+
+        Returns the face result, the hand result (None if gestures did not run), and the gesture name."""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        fr = face.detect_for_video(image, ts)
+        run_gestures = sched.gestures_due(live=live)
+        gr = gest.recognize_for_video(image, ts) if run_gestures else None
+
+        blend = yaw = pitch = None
+        if fr.face_blendshapes:
+            blend = {c.category_name: c.score for c in fr.face_blendshapes[0]}
+            if fr.facial_transformation_matrixes:
+                pose = head_pose_from_matrix(fr.facial_transformation_matrixes[0])
+                if pose is not None:
+                    yaw, pitch, _roll = pose
+        gesture = wrist_x = None
+        hand = None
+        if gr is not None:
+            if gr.gestures and gr.gestures[0]:
+                top = gr.gestures[0][0]
+                if top.score > 0.5 and top.category_name != "None":
+                    gesture = top.category_name
+            if gr.hand_landmarks:
+                wrist_x = gr.hand_landmarks[0][0].x
+            hand = bool(gr.hand_landmarks)
+
+        ev = self.perception.update(now, blend, yaw, gesture, wrist_x, pitch, hand_fresh=run_gestures)
+        label = self.perception.state_label()
+        if self.timeline is not None:
+            self.timeline.observe(self.clock.t_ms(now), label)
+        seen = None
+        if fr.face_landmarks:
+            pts = fr.face_landmarks[0]
+            if pts:
+                seen = (
+                    (sum(p.x for p in pts) / len(pts) - 0.5) * 2,
+                    (sum(p.y for p in pts) / len(pts) - 0.5) * 2,
+                )
+        held = hold.update(now, seen)
+        self.state.set(
+            mood=self.perception.mood,
+            face_x=held[0] if held else None,
+            face_y=held[1] if held else None,
+            face_present=held is not None,
+            vision_ts=now,
+        )
+        if ev:
+            self.state.set(last_event=ev.text)
+            self.on_event(ev)
+        sched.done(now, seen, label, event=ev is not None, hand=hand)
+        return fr, gr, gesture
 
     def _open_camera(self):
         cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW) if hasattr(cv2, "CAP_DSHOW") else None
@@ -176,7 +239,7 @@ class VisionWorker(threading.Thread):
         for lm in fr.face_landmarks[:1]:
             for p in lm[::4]:
                 cv2.circle(frame, (int(p.x * w), int(p.y * h)), 1, (0, 255, 0), -1)
-        for hand in gr.hand_landmarks:
+        for hand in gr.hand_landmarks if gr is not None else []:
             for p in hand:
                 cv2.circle(frame, (int(p.x * w), int(p.y * h)), 3, (255, 128, 0), -1)
         p = self.perception
