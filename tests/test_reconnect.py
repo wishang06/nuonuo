@@ -5,7 +5,7 @@ import asyncio
 from nuonuo import realtime
 from nuonuo.persona import ConversationRecap, build_instructions, resume_note
 from nuonuo.realtime import Backoff
-from tests.live_fakes import Deny, Fail, FakePlayer, FakeServer, Talk, make_client, run_until, wait_until
+from tests.live_fakes import Deny, Fail, FakePlayer, FakeServer, Silent, Talk, make_client, run_until, wait_until
 
 TURNS = [
     ("user", "I want to map my whole flat with the robot vacuum"),
@@ -138,4 +138,97 @@ def test_the_default_voice_being_refused_still_backs_off(tmp_path):
 
     asyncio.run(scenario())
     assert client.sleeps[:3] == [1, 2, 4]
-    assert [start["session"]["audio"]["output"]["voice"] for start in server.starts][:3] == ["maple", "marin", "marin"]
+    # Each round tries the configured voice, then the default, then backs off.
+    voices = [start["session"]["audio"]["output"]["voice"] for start in server.starts]
+    assert voices[:4] == ["maple", "marin", "maple", "marin"]
+
+
+def test_a_valid_voice_is_kept_when_the_default_is_refused_too(tmp_path):
+    # Both refused: the voice name was not the reason, so cedar must not be replaced for the whole run.
+    server = FakeServer([Deny(), Deny(), Talk()])
+    client = make_client(tmp_path, server, voice="cedar")
+
+    asyncio.run(run_until(client, lambda: client.started.is_set()))
+
+    voices = [start["session"]["audio"]["output"]["voice"] for start in server.starts]
+    assert voices == ["cedar", "marin", "cedar"]
+    assert client.sleeps == [1]
+    assert client.voice == "cedar"
+
+
+def test_turns_from_a_new_session_never_merge_into_the_old_one(tmp_path):
+    # The server's start_ms counts from the start of each live session, so it restarts after a
+    # reconnect. The fake does the same: both sessions report their first turn at 1000 ms.
+    server = FakeServer([
+        Talk([("user", "first session question about robots")], then="drop"),
+        Talk([("user", "second session follow up")]),
+    ])
+    client = make_client(tmp_path, server)
+
+    asyncio.run(run_until(client, lambda: len(client.transcript) >= 2 or "follow up" in str(client.transcript)))
+
+    # The fake reconnects instantly, the worst case: both turns land on the same app-clock moment
+    # and are from the same speaker, and they still stay separate turns.
+    assert [turn["text"] for turn in client.transcript] == [
+        "first session question about robots",
+        "second session follow up",
+    ]
+    assert client.recap.lines("Andy") == [
+        "Andy: first session question about robots",
+        "Andy: second session follow up",
+    ]
+
+
+class SetClock:
+    """An app clock the test moves by hand."""
+
+    def __init__(self):
+        self.now_ms = 0
+
+    def t_ms(self, now=None) -> int:
+        return self.now_ms
+
+
+def test_server_timestamps_are_shifted_onto_the_app_clock(tmp_path):
+    clock = SetClock()
+    server = FakeServer([
+        Talk([("user", "first session question about robots")], then="drop"),
+        Talk([("user", "second session follow up")]),
+    ])
+    client = make_client(tmp_path, server, clock=clock)
+    record = client._sleep
+
+    async def link_down(seconds):
+        clock.now_ms = 60_000  # the second session opens a minute into the run
+        await record(seconds)
+
+    client._sleep = link_down
+
+    asyncio.run(run_until(client, lambda: len(client.transcript) >= 2))
+
+    # Both sessions reported their turn at 1000-2500 ms of their own session time.
+    first, second = client.transcript
+    assert (first["t_ms"], first["end_ms"]) == (1_000, 2_500)
+    assert (second["t_ms"], second["end_ms"]) == (61_000, 62_500)
+
+
+def test_a_start_that_never_answers_is_still_asked_to_close(tmp_path, monkeypatch):
+    monkeypatch.setattr(realtime, "START_TIMEOUT", 0.3)
+    server = FakeServer([Silent(), Talk()])
+    client = make_client(tmp_path, server)
+
+    asyncio.run(run_until(client, lambda: client.started.is_set()))
+
+    hung = server.sockets[0]
+    assert [event["type"] for event in hung.sent] == ["session.start", "session.close"]
+    assert client.sleeps == [1]
+    assert client.logger.voice_sessions[0]["reason"] == "stop"  # only the second session ever opened
+
+
+def test_a_session_that_starts_after_the_app_stops_is_not_opened(tmp_path):
+    client = make_client(tmp_path, FakeServer())
+    client.state.stop.set()
+    client._mark_started()
+    assert not client.started.is_set()
+    assert client.gate.session_start is None
+    assert client._started_at is None

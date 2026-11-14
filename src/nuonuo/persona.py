@@ -29,13 +29,16 @@ class ConversationRecap:
         self.topic = ""
         self.merge_ms = merge_ms
 
-    def add(self, role: str, text: str, start_ms: int, end_ms: int | None = None) -> None:
-        """Add a transcript delta. Deltas from the same speaker close together merge into one turn."""
+    def add(self, role: str, text: str, start_ms: int, end_ms: int | None = None, new_turn: bool = False) -> None:
+        """Add a transcript delta. Deltas from the same speaker close together merge into one turn.
+
+        new_turn=True starts a new turn regardless. The client passes it for the first delta of a
+        new live session, so nothing is glued onto the last turn of the session before."""
         if not text:
             return
         end_ms = start_ms if end_ms is None else end_ms
         last = self.turns[-1] if self.turns else None
-        if last is not None and last["role"] == role and start_ms - last["end_ms"] < self.merge_ms:
+        if last is not None and not new_turn and last["role"] == role and start_ms - last["end_ms"] < self.merge_ms:
             last["text"] += text
             last["end_ms"] = max(last["end_ms"], end_ms)
         else:

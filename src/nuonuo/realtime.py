@@ -52,6 +52,8 @@ BACKOFF_MAX = 30.0
 BACKOFF_RESET_AFTER = 30.0  # a session that stayed up this long starts the next backoff at 1 s again
 START_TIMEOUT = 15.0  # seconds to wait for session.started before treating the attempt as failed
 CLOSE_WAIT = 5.0  # seconds to wait for session.closed after asking to close
+CLOSE_WAIT_UNSTARTED = 1.0  # the same wait when session.started never arrived
+OPEN_TIMEOUT = 6.0  # websocket handshake limit, shorter than the app's shutdown join so quitting never outruns it
 GATE_POLL = 0.2
 MIC_WAKE_RMS = 0.03  # mic level that counts as speech for waking her when there is no camera
 HEARD_GAP = 0.3
@@ -193,6 +195,10 @@ class RealtimeClient:
         self._started_at: float | None = None
         self._last_uptime = 0.0
         self._end_lock = threading.Lock()
+        self.configured_voice = voice
+        self._fallback_unproven = False  # fell back to the default voice, and it has not started a session yet
+        self._session_base_ms = 0  # app-clock time at which the current live session started
+        self._new_session_turn = False  # the next transcript delta is the first of a new live session
 
     def _now(self) -> float:
         return time.monotonic()
@@ -313,12 +319,18 @@ class RealtimeClient:
         self.state.set(status="connecting" if resume is None else "reconnecting")
         headers = {"Authorization": f"Bearer {self.api_key}"}
         try:
-            async with self._connect(LIVE_URL, additional_headers=headers, max_size=None) as ws:
-                await self._send(ws, self._session_start(resume))
-                await self._serve(ws)
-                # Book the minutes now. Leaving this block waits for the websocket close handshake,
-                # which can take a couple of seconds and is not voice time.
-                self._end_session()
+            connecting = self._connect(
+                LIVE_URL, additional_headers=headers, max_size=None, open_timeout=OPEN_TIMEOUT
+            )
+            async with connecting as ws:
+                if self.state.stop.is_set():
+                    self._end_reason = "stop"  # the app quit while the socket was opening: start nothing
+                else:
+                    await self._send(ws, self._session_start(resume))
+                    await self._serve(ws)
+                    # Book the minutes now. Leaving this block waits for the websocket close handshake,
+                    # which can take a couple of seconds and is not voice time.
+                    self._end_session()
         except asyncio.CancelledError:
             if self._end_reason is None:
                 self._end_reason = "cancelled"
@@ -458,8 +470,8 @@ class RealtimeClient:
                 break
             if not self.started.is_set() and self._now() - opened > START_TIMEOUT:
                 log.warning("live session did not start within %.0fs", START_TIMEOUT)
-                self._end_reason = "start_timeout"
-                return
+                reason = "start_timeout"
+                break
             await asyncio.sleep(GATE_POLL)
         await self._request_close(ws, reason)
 
@@ -467,11 +479,15 @@ class RealtimeClient:
         self._closing = reason
         if self._end_reason is None:
             self._end_reason = reason
-        if not self.started.is_set() or self.closed:
+        if self.closed:
             return
-        log.info("closing live session (%s)", reason)
+        started = self.started.is_set()
+        if started:
+            log.info("closing live session (%s)", reason)
+        # Sent even if session.started never arrived. The server may have opened the session without
+        # the reply reaching us, and it should not be left holding it.
         await self._send(ws, {"type": "session.close", "event_id": self._event_id("close")})
-        deadline = self._now() + CLOSE_WAIT
+        deadline = self._now() + (CLOSE_WAIT if started else CLOSE_WAIT_UNSTARTED)
         while not self.closed and self._now() < deadline:
             await asyncio.sleep(0.1)
 
@@ -580,14 +596,23 @@ class RealtimeClient:
         delta = event.get("delta") or ""
         if not delta:
             return
-        start_ms = int(event.get("start_ms") or self.clock.t_ms())
-        end_ms = int(event.get("end_ms") or start_ms)
-        if self.transcript and self.transcript[-1]["role"] == role and start_ms - int(self.transcript[-1].get("end_ms", start_ms)) < 1500:
-            self.transcript[-1]["text"] += delta
-            self.transcript[-1]["end_ms"] = end_ms
+        # The server's start_ms and end_ms count from the start of its own live session, so they
+        # restart near zero after a reconnect. Shift them onto the app clock: one timeline for the run.
+        if event.get("start_ms") is not None:
+            start_ms = self._session_base_ms + int(event["start_ms"])
+            end_ms = self._session_base_ms + int(event.get("end_ms") or event["start_ms"])
+        else:
+            start_ms = end_ms = self.clock.t_ms()
+        # The first delta of a new live session always starts a new turn. It must not be glued onto
+        # the last turn of the session before it.
+        fresh, self._new_session_turn = self._new_session_turn, False
+        last = self.transcript[-1] if self.transcript else None
+        if last is not None and not fresh and last["role"] == role and start_ms - int(last.get("end_ms", start_ms)) < 1500:
+            last["text"] += delta
+            last["end_ms"] = end_ms
         else:
             self.transcript.append({"role": role, "text": delta, "t_ms": start_ms, "end_ms": end_ms})
-        self.recap.add(role, delta, start_ms, end_ms)
+        self.recap.add(role, delta, start_ms, end_ms, new_turn=fresh)
         log.info("%s: %s", "You" if role == "user" else "Nuonuo", delta)
 
     def _mark_started(self) -> None:
@@ -595,12 +620,23 @@ class RealtimeClient:
             while queue is not None and not queue.empty():
                 queue.get_nowait()
         self._tick_queued = False
+        if self.state.stop.is_set():
+            # The app is quitting. Shutdown may already have booked the minutes, so don't open the
+            # books again: leave the session unmarked and let _watch ask the server to close it.
+            return
         # Send the current camera note on the first tick, so the new session knows what she sees.
         self.notes.rearm()
+        self._session_base_ms = self.clock.t_ms()
+        self._new_session_turn = True
+        if self._fallback_unproven:
+            self._fallback_unproven = False
+            log.warning(
+                "Voice %r works where %r was refused; using it for this run.", self.voice, self.configured_voice
+            )
         now = self._now()
         with self._end_lock:
             self._started_at = now
-        self.gate.session_opened(now)
+            self.gate.session_opened(now)
         self.started.set()
         self.state.set(status="listening")
 
@@ -671,8 +707,14 @@ class RealtimeClient:
                             DEFAULT_VOICE,
                         )
                         self.voice = DEFAULT_VOICE
+                        self._fallback_unproven = True
                         self._end_reason = "voice_refused"
                     else:
+                        if self._fallback_unproven:
+                            # The default voice was refused as well, so the voice name is not the reason.
+                            # Go back to the configured voice rather than replace it for the whole run.
+                            self._fallback_unproven = False
+                            self.voice = self.configured_voice
                         log.error(
                             "OpenAI refused the voice session (%s) with the default voice. "
                             "A previous run may still be holding one, or this API key cannot open GPT-Live. "

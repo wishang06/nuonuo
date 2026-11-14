@@ -19,6 +19,10 @@ class Deny:
     """The server answers session.start with a forbidden error."""
 
 
+class Silent:
+    """The socket opens and session.start is accepted, but session.started never comes."""
+
+
 class Talk:
     """The session starts, the scripted turns arrive, then `then` happens.
 
@@ -66,6 +70,8 @@ class FakeSocket:
     def _on_start(self) -> None:
         plan = self.plan
         voice = self.server.starts[-1]["session"]["audio"]["output"]["voice"]
+        if isinstance(plan, Silent):
+            return
         if isinstance(plan, Deny) or (self.server.voices is not None and voice not in self.server.voices):
             self.push({"type": "error", "error": {"code": "forbidden", "message": "Voice session access denied."}})
             return
@@ -107,7 +113,7 @@ class FakeServer:
         self.sockets: list[FakeSocket] = []
         self.connects = 0
 
-    def connect(self, url, additional_headers=None, max_size=None):
+    def connect(self, url, additional_headers=None, max_size=None, open_timeout=None):
         self.connects += 1
         plan = self.plans.pop(0) if self.plans else Talk()
         if isinstance(plan, Fail):
@@ -164,7 +170,13 @@ class FakePlayer:
 
 
 def make_client(
-    tmp_path, server: FakeServer, *, cfg: GateConfig | None = None, usage: DailyUsage | None = None, voice: str = "marin"
+    tmp_path,
+    server: FakeServer,
+    *,
+    cfg: GateConfig | None = None,
+    usage: DailyUsage | None = None,
+    voice: str = "marin",
+    clock=None,
 ):
     """A client wired to fakes. Backoff sleeps are recorded in client.sleeps instead of waited out."""
     state = SharedState()
@@ -180,6 +192,7 @@ def make_client(
         voice,
         "Andy",
         slog,
+        clock=clock,
         gate=gate,
         connect=server.connect,
         player_factory=FakePlayer,
