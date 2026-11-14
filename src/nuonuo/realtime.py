@@ -40,6 +40,7 @@ from nuonuo.timeline import BehaviourTimeline, read_camera
 log = logging.getLogger("nuonuo.live")
 
 LIVE_URL = "wss://api.openai.com/v1/live/sessions"
+DEFAULT_VOICE = "marin"  # a voice name the server does not accept is refused with "forbidden"
 RATE = 24000
 CHUNK = 480  # 20 ms
 SALIENT_RESPONSE_COOLDOWN = 6.0
@@ -253,6 +254,8 @@ class RealtimeClient:
             reason = await self._run_session(resume)
             if self.state.stop.is_set() or reason == "stop":
                 return
+            if reason == "voice_refused":
+                continue  # the voice is now the default: try again right away, no backoff
             started = self._last_uptime > 0
             if reason in RETRY_REASONS:
                 if self._last_uptime >= BACKOFF_RESET_AFTER:
@@ -313,6 +316,9 @@ class RealtimeClient:
             async with self._connect(LIVE_URL, additional_headers=headers, max_size=None) as ws:
                 await self._send(ws, self._session_start(resume))
                 await self._serve(ws)
+                # Book the minutes now. Leaving this block waits for the websocket close handshake,
+                # which can take a couple of seconds and is not voice time.
+                self._end_session()
         except asyncio.CancelledError:
             if self._end_reason is None:
                 self._end_reason = "cancelled"
@@ -651,15 +657,30 @@ class RealtimeClient:
                 message = err.get("message") if isinstance(err, dict) else str(err)
                 log.warning("live error: %s", err)
                 if code == "forbidden":
-                    log.error(
-                        "OpenAI refused the voice session (%s). "
-                        "A previous run may still be holding one, or this API key cannot open GPT-Live. "
-                        "Retrying with backoff. The avatar keeps running.",
-                        message,
-                    )
                     self.closed = True
-                    self._end_reason = "denied"
-                    self.state.set(status="voice denied")
+                    if self.voice != DEFAULT_VOICE:
+                        # The server answers "forbidden: Voice session access denied." for any voice
+                        # name it does not accept, so try the default voice before giving up.
+                        log.warning(
+                            "OpenAI refused the voice session (%s) with voice %r. It answers this way for a "
+                            "voice name it does not accept. Falling back to %r. Set NUONUO_VOICE=%s in .env "
+                            "to skip this.",
+                            message,
+                            self.voice,
+                            DEFAULT_VOICE,
+                            DEFAULT_VOICE,
+                        )
+                        self.voice = DEFAULT_VOICE
+                        self._end_reason = "voice_refused"
+                    else:
+                        log.error(
+                            "OpenAI refused the voice session (%s) with the default voice. "
+                            "A previous run may still be holding one, or this API key cannot open GPT-Live. "
+                            "Retrying with backoff. The avatar keeps running.",
+                            message,
+                        )
+                        self._end_reason = "denied"
+                        self.state.set(status="voice denied")
                     return
         if self._end_reason is None:
             self._end_reason = self._closing or "dropped"

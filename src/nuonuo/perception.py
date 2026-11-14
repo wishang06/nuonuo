@@ -306,6 +306,9 @@ class DetectionScheduler:
     event) sets the next interval to the minimum. A calm one stretches it by detect_slowdown,
     up to the maximum. Gestures run on every gesture_every-th detection, and on every detection
     while a hand is in view so a wave still gets enough wrist samples.
+
+    While the debug preview is open (live=True), both run on every frame: the preview is for
+    tuning thresholds, and an overlay that lags the picture is useless for that.
     """
 
     def __init__(self, cfg: dict | None = None):
@@ -317,11 +320,12 @@ class DetectionScheduler:
         self._face: tuple[float, float] | None = None
         self._label: str | None = None
 
-    def due(self, now: float) -> bool:
-        return now >= self.next_at
+    def due(self, now: float, live: bool = False) -> bool:
+        """live=True (the debug preview is open) detects on every frame, so the overlay tracks the picture."""
+        return live or now >= self.next_at
 
-    def gestures_due(self) -> bool:
-        if self.hand and self.cfg["gesture_boost_with_hand"]:
+    def gestures_due(self, live: bool = False) -> bool:
+        if live or (self.hand and self.cfg["gesture_boost_with_hand"]):
             return True
         return self.count % max(1, int(self.cfg["gesture_every"])) == 0
 

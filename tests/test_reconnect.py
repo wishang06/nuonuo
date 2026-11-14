@@ -5,7 +5,7 @@ import asyncio
 from nuonuo import realtime
 from nuonuo.persona import ConversationRecap, build_instructions, resume_note
 from nuonuo.realtime import Backoff
-from tests.live_fakes import Deny, Fail, FakePlayer, FakeServer, Talk, make_client, run_until
+from tests.live_fakes import Deny, Fail, FakePlayer, FakeServer, Talk, make_client, run_until, wait_until
 
 TURNS = [
     ("user", "I want to map my whole flat with the robot vacuum"),
@@ -111,3 +111,31 @@ def test_resume_wording_for_reconnect_and_wake():
     assert "stepped away" in wake and "Do not greet" not in wake
     assert "Andy: tell me about the moon landing" in wake
     assert "Picking up where you left off" not in build_instructions("Andy", recap=recap)
+
+
+def test_a_refused_voice_falls_back_to_the_default_right_away(tmp_path):
+    # OpenAI answers "forbidden: Voice session access denied." for a voice name it does not accept.
+    server = FakeServer(voices={"marin", "cedar"})
+    client = make_client(tmp_path, server, voice="maple")
+
+    asyncio.run(run_until(client, lambda: client.started.is_set()))
+
+    voices = [start["session"]["audio"]["output"]["voice"] for start in server.starts]
+    assert voices == ["maple", "marin"]
+    assert client.sleeps == []  # no backoff: the fix is known, so the retry is immediate
+    assert client.voice == "marin"
+
+
+def test_the_default_voice_being_refused_still_backs_off(tmp_path):
+    server = FakeServer(voices={"cedar"})
+    client = make_client(tmp_path, server, voice="maple")
+
+    async def scenario():
+        task = asyncio.create_task(client.run())
+        await wait_until(lambda: len(client.sleeps) >= 3)
+        client.state.stop.set()
+        await asyncio.wait_for(task, 5)
+
+    asyncio.run(scenario())
+    assert client.sleeps[:3] == [1, 2, 4]
+    assert [start["session"]["audio"]["output"]["voice"] for start in server.starts][:3] == ["maple", "marin", "marin"]

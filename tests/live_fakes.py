@@ -65,7 +65,8 @@ class FakeSocket:
 
     def _on_start(self) -> None:
         plan = self.plan
-        if isinstance(plan, Deny):
+        voice = self.server.starts[-1]["session"]["audio"]["output"]["voice"]
+        if isinstance(plan, Deny) or (self.server.voices is not None and voice not in self.server.voices):
             self.push({"type": "error", "error": {"code": "forbidden", "message": "Voice session access denied."}})
             return
         self.push({"type": "session.started", "session": {"id": f"live_test_{len(self.server.starts)}"}})
@@ -99,8 +100,9 @@ class FakeSocket:
 class FakeServer:
     """Hands out one scripted connection per connect(). Extra connects hold open."""
 
-    def __init__(self, plans=()):
+    def __init__(self, plans=(), voices=None):
         self.plans = list(plans)
+        self.voices = voices  # voice names the server accepts; None accepts any, like the plans expect
         self.starts: list[dict] = []
         self.sockets: list[FakeSocket] = []
         self.connects = 0
@@ -161,7 +163,9 @@ class FakePlayer:
         self.closed = True
 
 
-def make_client(tmp_path, server: FakeServer, *, cfg: GateConfig | None = None, usage: DailyUsage | None = None):
+def make_client(
+    tmp_path, server: FakeServer, *, cfg: GateConfig | None = None, usage: DailyUsage | None = None, voice: str = "marin"
+):
     """A client wired to fakes. Backoff sleeps are recorded in client.sleeps instead of waited out."""
     state = SharedState()
     state.set(face_present=True)
@@ -173,7 +177,7 @@ def make_client(tmp_path, server: FakeServer, *, cfg: GateConfig | None = None, 
         state,
         "sk-test",
         "gpt-live-1",
-        "marin",
+        voice,
         "Andy",
         slog,
         gate=gate,

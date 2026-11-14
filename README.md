@@ -20,7 +20,7 @@ Nuonuo is an energetic little anime companion that lives in a small always-on-to
 | Flag | Effect |
 |---|---|
 | `--no-vision` | Turn off the webcam (same as `VISION_ENABLED=false`) |
-| `--preview` | Show a debug webcam window with landmarks, blendshape values, and states |
+| `--preview` | Show a debug webcam window with landmarks, blendshape values, and states. While it is open, detection runs on every frame so the overlay tracks you (this costs the CPU the reduced cadence otherwise saves) |
 | `--no-voice` | Avatar and vision only, with no API calls (vision events go to the console) |
 | `--camera N` | Use webcam index N |
 | `--model NAME` | Override `NUONUO_MODEL` (default `gpt-live-1`) |
@@ -45,6 +45,8 @@ uv run python -m nuonuo.avatar --calibrate
 ### .env
 
 `OPENAI_API_KEY`, `NUONUO_MODEL` (default `gpt-live-1`), `NUONUO_BACKEND_MODEL` (default `gpt-6-luna`, the delegated model that calls `read_camera`), `NUONUO_SUMMARY_MODEL` (default `gpt-6-luna`, used only at session end), `VISION_ENABLED`, and optionally `USER_NAME` (default Andy) and `NUONUO_VOICE` (default `marin`). A `NUONUO_MODEL` value that starts with `gpt-realtime` is treated as `gpt-live-1`.
+
+`marin` and `cedar` are accepted voice names. A name the server does not accept (`maple`, for example) is refused with `forbidden: Voice session access denied.` That message is about the voice, not the API key. When it happens she logs a warning, falls back to `marin`, and retries at once.
 
 Voice session gate and caps, all optional:
 
@@ -89,7 +91,7 @@ The mic stream, speaker, and session clock stay open for the whole run. Live ses
 - **Recap** (`persona.ConversationRecap`). The last six turns and the current topic (the latest user turn of four or more words) are kept in memory. A reopened session's instructions add them after the persona prompt, with an instruction not to greet again or mention the connection. After an idle close she may say a short hello when you come back, without introducing herself again.
 - **Sleep**. Windows Modern Standby suspends the app, and `time.monotonic()` keeps counting. A gap of 60 s or more between gate readings is treated as sleep. It is not counted as voice or idle time, and an open session is reopened right away, because the server has almost certainly dropped it.
 
-Vision does not run MediaPipe on every frame. `perception.DetectionScheduler` runs face detection every `detect_min_seconds` (0.15) to `detect_max_seconds` (0.5): back to the minimum whenever the face moves, appears, leaves, or changes state, and stretched by `detect_slowdown` after each calm detection. The gesture recognizer runs on every `gesture_every`-th (4th) detection, and on every detection while a hand is in view (`gesture_boost_with_hand`), so a wave still gets enough wrist samples. Between detections the last reading is held, and the face position is held through a missed detection for `face_hold_seconds`, so the avatar's gaze doesn't jump. Between detections the vision thread sleeps. Each detection reads a fresh frame, because DirectShow's `read()` waits for the next new frame. With the preview open, every frame is read and drawn with the last results. If the webcam stops sending frames for 2 s it is released and reopened.
+Vision does not run MediaPipe on every frame. `perception.DetectionScheduler` runs face detection every `detect_min_seconds` (0.15) to `detect_max_seconds` (0.5): back to the minimum whenever the face moves, appears, leaves, or changes state, and stretched by `detect_slowdown` after each calm detection. The gesture recognizer runs on every `gesture_every`-th (4th) detection, and on every detection while a hand is in view (`gesture_boost_with_hand`), so a wave still gets enough wrist samples. Between detections the last reading is held, and the face position is held through a missed detection for `face_hold_seconds`, so the avatar's gaze doesn't jump. Between detections the vision thread sleeps. Each detection reads a fresh frame, because DirectShow's `read()` waits for the next new frame. While the debug preview is open, face detection and gestures run on every frame again, so the overlay tracks the picture for tuning. If the webcam stops sending frames for 2 s it is released and reopened.
 
 Perception turns each frame into a state label. `timeline.py` merges that into spans `(state, start_ms, end_ms)`. The last 60 seconds stay as spans. Older time, up to 10 minutes, is folded into aggregates such as "smiling 50% of last 10 min, away twice". Head pitch distinguishes looking away from looking down at a phone.
 
@@ -145,6 +147,6 @@ Run the tests with `uv run pytest`.
 - Gestures are sampled less often to save CPU. In a calm scene a held thumbs-up registers within about 0.4 to 2.3 s and a wave within about 0.7 to 2.6 s (it was about 0.3 s when every frame was processed). A gesture shorter than that can be missed. Lower `gesture_every` or `detect_max_seconds` in `perception.CONFIG` if that matters more than CPU.
 - With the camera off, waking her relies on a plain mic-level threshold (`MIC_WAKE_RMS` in `realtime.py`), so a loud noise can wake her. A false wake costs at most `IDLE_TIMEOUT_MIN` of voice time.
 - The recap's "current topic" is the latest user turn of four or more words, not a model-written summary.
-- The GPT-Live event names follow the current Live websocket guide. They have not been tried against a live API session from this laptop.
+- The GPT-Live events used for a conversation were checked against the live API on 2026-11-13: `session.start`/`session.started`, input and output transcript deltas, output audio, `session.usage`, `session.close`/`session.closed`, the `forbidden` error, and reconnecting after a dropped socket. The `read_camera` tool round trip (`response.event`) follows the Live websocket guide and has not been seen in a live session yet.
 - The webcam is only open while vision is on. Turning vision off with `V` releases it. MediaPipe models still load at startup so that `V` can turn vision back on.
 - `mediapipe` depends on `opencv-contrib-python`, and this project also lists `opencv-python`. Both provide `cv2`. If `cv2` misbehaves, remove `opencv-python` from `pyproject.toml` and run `uv sync` again.

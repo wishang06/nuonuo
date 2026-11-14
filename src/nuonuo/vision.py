@@ -98,8 +98,6 @@ class VisionWorker(threading.Thread):
         t0 = time.monotonic()
         last_ts = -1
         preview_open = False
-        fr = gr = None
-        gesture = None
         last_frame = time.monotonic()
         camera_lost = False
         try:
@@ -129,9 +127,11 @@ class VisionWorker(threading.Thread):
                         log.info("Webcam is back")
                         camera_lost = False
                     last_frame = time.monotonic()
+                # With the debug preview open, detect on every frame so the overlay tracks the picture.
+                # The reduced cadence is for normal running, when nobody is watching the landmarks.
+                live = bool(self.state.preview)
                 now = time.monotonic()
-                detect = sched.due(now)
-                if not detect and not self.state.preview:
+                if not sched.due(now, live=live):
                     # Sleep until the next detection. Don't spin on cap.grab(): on DirectShow it returns
                     # at once (hundreds of thousands of calls a second, a whole core). cap.read() waits
                     # for the next new frame, so the frame read after this sleep is a current one.
@@ -150,19 +150,18 @@ class VisionWorker(threading.Thread):
                     continue
                 last_frame = time.monotonic()
                 frame = cv2.flip(frame, 1)
-                if detect:
-                    now = time.monotonic()
-                    ts = max(int((now - t0) * 1000), last_ts + 1)
-                    last_ts = ts
-                    fr, gr, gesture = self._detect(mp, face, gest, frame, now, ts, sched, hold, gr, gesture)
+                now = time.monotonic()
+                ts = max(int((now - t0) * 1000), last_ts + 1)
+                last_ts = ts
+                fr, gr, gesture = self._detect(mp, face, gest, frame, now, ts, sched, hold, live)
 
-                if self.state.preview and fr is not None:
+                if live:
                     self._draw(frame, fr, gr, gesture)
                     cv2.imshow("Nuonuo preview (P to hide)", frame)
                     preview_open = True
                     if cv2.waitKey(1) & 0xFF in (ord("p"), ord("P")):
                         self.state.set(preview=False)
-                elif preview_open and not self.state.preview:
+                elif preview_open:
                     cv2.destroyAllWindows()
                     preview_open = False
         finally:
@@ -171,16 +170,14 @@ class VisionWorker(threading.Thread):
             face.close()
             gest.close()
 
-    def _detect(
-        self, mp, face, gest, frame, now: float, ts: int, sched: DetectionScheduler, hold: ReadingHold, last_gr, last_gesture
-    ):
-        """One detection: face every time, gestures when the scheduler says so.
+    def _detect(self, mp, face, gest, frame, now: float, ts: int, sched: DetectionScheduler, hold: ReadingHold, live: bool):
+        """One detection: face every time, gestures when the scheduler says so (always, in live mode).
 
-        Returns what the preview draws. Hand results are held from the last gesture run."""
+        Returns the face result, the hand result (None if gestures did not run), and the gesture name."""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         fr = face.detect_for_video(image, ts)
-        run_gestures = sched.gestures_due()
+        run_gestures = sched.gestures_due(live=live)
         gr = gest.recognize_for_video(image, ts) if run_gestures else None
 
         blend = yaw = pitch = None
@@ -225,8 +222,6 @@ class VisionWorker(threading.Thread):
             self.state.set(last_event=ev.text)
             self.on_event(ev)
         sched.done(now, seen, label, event=ev is not None, hand=hand)
-        if gr is None:
-            return fr, last_gr, last_gesture
         return fr, gr, gesture
 
     def _open_camera(self):

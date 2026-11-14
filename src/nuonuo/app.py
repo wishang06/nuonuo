@@ -135,7 +135,7 @@ def main(argv=None) -> None:
             log.error("OPENAI_API_KEY missing; set it in .env or use --no-voice")
             sys.exit(1)
         from nuonuo.gate import DailyUsage, GateConfig, VoiceGate
-        from nuonuo.realtime import RealtimeClient, run_realtime_thread
+        from nuonuo.realtime import DEFAULT_VOICE, RealtimeClient, run_realtime_thread
 
         gate_cfg = GateConfig.from_env()
         usage = DailyUsage(root / "data" / "voice_usage.json")
@@ -144,7 +144,7 @@ def main(argv=None) -> None:
             state,
             key,
             model,
-            os.getenv("NUONUO_VOICE", "marin"),
+            os.getenv("NUONUO_VOICE") or DEFAULT_VOICE,
             user,
             slog,
             timeline,

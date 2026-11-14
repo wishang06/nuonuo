@@ -159,3 +159,17 @@ def test_reading_hold_keeps_the_face_through_a_missed_detection():
     assert hold.update(0.75, None) == (0.2, -0.1)
     assert hold.update(0.9, None) is None
     assert hold.update(1.0, (0.1, 0.0)) == (0.1, 0.0)
+
+
+def test_the_debug_preview_detects_on_every_frame():
+    # With the preview window open the overlay has to track the picture, so nothing is skipped.
+    sched = DetectionScheduler()
+    for i in range(30):
+        t = i / FPS
+        assert sched.due(t, live=True)
+        assert sched.gestures_due(live=True)
+        sched.done(t, (0.0, 0.0), "present", hand=False)
+    # Closing the preview goes straight back to the reduced cadence.
+    t = 30 / FPS
+    assert not sched.due(t)
+    assert not sched.gestures_due()
